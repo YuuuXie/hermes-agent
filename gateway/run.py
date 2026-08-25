@@ -1008,11 +1008,10 @@ def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
-
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    ``interactive`` is retained for adapter and call-site compatibility.  An
+    empty synthesized startup turn has the same contract on every platform:
+    continue the interrupted work without requiring a human to type
+    ``continue``.  A real new user message still takes precedence.
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
@@ -1023,22 +1022,21 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
         )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion.")
+            "No new user message is attached. Review the conversation "
+            "history and CONTINUE the interrupted task to completion. "
+            "Do not stop at a 'session restored' acknowledgement or require "
+            "the user to type 'continue'. If continuation needs a genuinely "
+            "new approval or an unavailable fact, state that exact blocker."
+        )
         tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded "
+            "result. If a side effect may have happened but its result was "
+            "not persisted, inspect live state before deciding whether to "
+            "retry it."
+        )
     return (
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "

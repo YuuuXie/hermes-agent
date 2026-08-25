@@ -302,11 +302,14 @@ class TestResumePendingSystemNote:
         )
 
 
-    def test_empty_message_noninteractive_note_continues_task(self):
-        """Non-interactive platforms (webhook, API server): nobody can answer
-        'what next?', so the resumed turn must complete the interrupted work
-        instead of acknowledging (#57056)."""
-        note = build_resume_recovery_note("restart_timeout", "", interactive=False)
+    @pytest.mark.parametrize("interactive", [True, False])
+    def test_empty_message_continues_interrupted_task(self, interactive):
+        """A synthesized startup turn must finish interrupted work on every
+        platform.  Interactive users should not have to type ``continue``
+        after the gateway already has a durable recovery checkpoint."""
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=interactive
+        )
         assert "CONTINUE the interrupted task" in note
         assert "session was restored" not in note
         assert "ask what they would like to do next" not in note
@@ -316,10 +319,13 @@ class TestResumePendingSystemNote:
         assert "already appear in the history" in note
 
 
-    def test_resume_note_is_persisted_instead_of_original_empty_message(self):
+    @pytest.mark.parametrize("interactive", [True, False])
+    def test_resume_note_is_persisted_instead_of_original_empty_message(
+        self, interactive
+    ):
         """The auto-resume note must not leave an empty row in state.db."""
         message, persisted = _prepare_resume_pending_message(
-            "restart_timeout", "", interactive=False
+            "restart_timeout", "", interactive=interactive
         )
 
         assert message
