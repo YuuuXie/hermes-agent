@@ -200,7 +200,9 @@ class _HeldChild:
 
     def run_conversation(self, **_kwargs):
         self.started.set()
-        self.release.wait(timeout=10)
+        # Only the test's finally block may release this worker. A wall timeout
+        # lets it exit before the quarantine assertions on a loaded host.
+        self.release.wait()
         return {"final_response": "", "completed": False, "api_calls": 1, "messages": []}
 
     def steer(self, text: str) -> bool:
