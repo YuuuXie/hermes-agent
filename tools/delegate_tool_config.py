@@ -138,6 +138,25 @@ def _get_child_timeout() -> Optional[float]:
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
     )
 
+DEFAULT_HANDOFF_GRACE: float = 300.0
+
+def _parse_grace(raw: Any) -> Optional[float]:
+    """Seconds → None (<= 0 disables) or the value. Raises on non-numeric."""
+    parsed = float(raw)
+    return None if parsed <= 0 else parsed
+
+def _get_handoff_grace_seconds() -> Optional[float]:
+    """delegation.handoff_grace_seconds (default 300, 0/negative disables): how long before a child's HARD deadline
+    it is steered, exactly once, to write a handoff (completed / remaining / test receipts) into its workspace.
+
+    This does NOT extend any deadline — it is a cutoff measured backwards from the existing
+    delegation.child_timeout_seconds wall, and it is clamped so a grace larger than the timeout cannot fire before
+    the child has started. Env fallback: DELEGATION_HANDOFF_GRACE_SECONDS."""
+    return _knob(
+        "handoff_grace_seconds", "DELEGATION_HANDOFF_GRACE_SECONDS", _parse_grace, DEFAULT_HANDOFF_GRACE,
+        "delegation.handoff_grace_seconds=%r is not a valid number; using default (300s)",
+    )
+
 def _get_max_spawn_depth() -> int:
     """delegation.max_spawn_depth floored at 1 (no ceiling). Depth 0 is the parent; agents at depths 0..N-1 may spawn,
     depth N is the leaf floor. Default 1 is flat. Each extra level multiplies API cost."""

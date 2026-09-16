@@ -25,6 +25,17 @@ from tools.delegate_tool_results import (
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
+# Near-deadline handoff instruction. Deliberately asks only for a WRITTEN record in the workspace: it must not start
+# new work with minutes left, and it must not claim completion. The child keeps working after writing it.
+_HANDOFF_STEER_TEXT = (
+    "[RUNTIME NOTICE — approaching your hard time limit] Your execution deadline is near and this turn may be cut "
+    "off without warning. Before doing anything else, write a handoff file into your workspace (e.g. HANDOFF.md) "
+    "containing: (1) what you actually COMPLETED, with file paths and commit SHAs; (2) what REMAINS, as concrete "
+    "next steps; (3) TEST RECEIPTS — the exact commands you ran and their real results, or an explicit statement "
+    "that you ran none. Do not start new work and do not claim anything you did not verify. After the file is "
+    "written you may continue, but keep it up to date. This notice is sent once."
+)
+
 def _num(value: Any, default: int = 0) -> int:
     """int() for counters that may be mocks/None on test doubles."""
     return int(value) if isinstance(value, (int, float)) else default
@@ -647,6 +658,7 @@ class _ChildRun:
     parent_reads_snapshot: list = field(default_factory=list)
     abandoned_future: Any = None
     cleanup_done: threading.Event = field(default_factory=threading.Event)
+    child_timeout_for_log: Any = None
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -718,6 +730,29 @@ class _ChildRun:
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
 
+    def send_handoff_steer(self) -> bool:
+        """Queue the near-deadline handoff instruction into the child EXACTLY ONCE, via the ordinary
+        ``steer_subagent`` path (AIAgent.steer → applied at the child's next iteration boundary).
+
+        Best-effort by construction: if the child is deep inside a long tool call there may be no remaining
+        iteration boundary for the text to land on, and the steer is simply lost. That is why the durable artifact
+        references attached to the timeout entry (worktree, child_session_id, files_written) are a SEPARATE fallback
+        that works without this instruction. The parent does not need to be awake: this fires from the wait loop the
+        parent thread is already sitting in, and never blocks it."""
+        if not self.subagent_id:
+            return False
+        try:
+            from tools.delegate_tool_registry import steer_subagent
+            landed = bool(steer_subagent(self.subagent_id, _HANDOFF_STEER_TEXT))
+        except Exception:
+            logger.warning("near-deadline handoff steer failed for %s", self.subagent_id, exc_info=True)
+            return False
+        logger.warning(
+            "Subagent %d near its %ss deadline: handoff instruction %s",
+            self.task_index, self.child_timeout_for_log, "queued" if landed else "REJECTED (child finishing)",
+        )
+        return landed
+
     def collect_partial_output_tail(self) -> List[Dict[str, Any]]:
         """Bounded, redacted tail of the timed-out child's COMPLETED tool results (8 × 600 chars).
 
@@ -777,10 +812,13 @@ class _ChildRun:
         via a Future done-callback (``close_deferred=True``) — closing here would race its still-unwinding finally
         path.
         """
-        from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
+        from tools.delegate_tool import (
+            _get_child_timeout, _get_handoff_grace_seconds, _get_subagent_approval_callback, _set_subagent_approval_cb,
+        )
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
+        self.child_timeout_for_log = child_timeout
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )
@@ -800,6 +838,14 @@ class _ChildRun:
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         timeout_deadline = time.monotonic() + child_timeout if child_timeout is not None else None
+        # Near-deadline handoff cutoff, measured BACKWARDS from the existing hard deadline: this never extends the
+        # wait. Clamped to half the timeout so a grace >= the timeout cannot fire before the child has done anything.
+        handoff_deadline: Optional[float] = None
+        if timeout_deadline is not None and child_timeout is not None:
+            grace = _get_handoff_grace_seconds()
+            if grace is not None and grace > 0:
+                handoff_deadline = timeout_deadline - min(float(grace), child_timeout / 2.0)
+        handoff_sent = False
         stale_watchdog = False
         try:
             while True:
@@ -808,6 +854,9 @@ class _ChildRun:
                 if release_stale_wait and heartbeat.stale.is_set():
                     stale_watchdog = True
                     raise FuturesTimeoutError()
+                if handoff_deadline is not None and not handoff_sent and time.monotonic() >= handoff_deadline:
+                    handoff_sent = True  # exactly once, whether or not the steer lands
+                    self.send_handoff_steer()
                 wait_seconds = 0.5
                 if timeout_deadline is not None:
                     remaining = timeout_deadline - time.monotonic()

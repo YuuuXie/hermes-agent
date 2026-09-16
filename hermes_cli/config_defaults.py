@@ -1272,6 +1272,10 @@ DEFAULT_CONFIG = {
         # Wall-clock cap per child (seconds, floor 30). 0 = no timeout: children fail only from real
         # errors (API, tools, iteration budget).
         "child_timeout_seconds": 0,
+        # Seconds before the child_timeout_seconds wall at which a child is steered ONCE to write a handoff
+        # (completed work / remaining work / test receipts) into its workspace, so a timeout still yields a
+        # resumable record. Never extends the deadline; inert when child_timeout_seconds is 0. 0 disables.
+        "handoff_grace_seconds": 300,
         # Subagent effort: "ultra" | "max" | "xhigh" | "high" | "medium" | "low" | "minimal" |
         # "none" (empty = inherit)
         "reasoning_effort": "",
