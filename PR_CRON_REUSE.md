@@ -1,4 +1,11 @@
-# PR_CRON_REUSE — verified local reuse-only port
+# PR_CRON_REUSE — historical report (feature retired)
+
+> **Retired:** the cron-owned reuse implementation and its default-on setting have been removed.
+> This report preserves historical design, attribution and test evidence; it is NOT current
+> setup guidance and its commands must not be replayed. Native `/goal`, `/loop` and
+> `/heartbeat` are the session-automation options. Old reuse job definitions are kept paused
+> and fail closed if fired without an explicit maintainer migration. Their transcripts
+> remain readable; unrelated reliability fixes and ordinary turn leases remain in place.
 
 ## Delivery and commits
 

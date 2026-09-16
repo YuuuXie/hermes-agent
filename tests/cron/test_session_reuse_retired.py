@@ -34,22 +34,43 @@ def test_creation_rejects_a_retired_mode_argument(tmp_path, monkeypatch):
 
 
 def test_every_tick_gets_its_own_session_id(tmp_path, monkeypatch):
-    """Two fires of the same job never share an execution session id."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    """Exercise actual scheduler runs; replace inference, not session-id construction."""
+    import sys
+    from datetime import datetime
+    from types import ModuleType
     import cron.scheduler as scheduler
+    from hermes_cli import runtime_provider
 
-    job = {"id": "abc123", "prompt": "p"}
-    stamps = iter(["20260916_120000", "20260916_130000"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+    observed = []
 
-    class _Now:
-        def strftime(self, _fmt):
-            return next(stamps)
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            observed.append(kwargs["session_id"])
 
-    monkeypatch.setattr(scheduler, "_hermes_now", lambda: _Now())
-    first = f"cron_{job['id']}_{scheduler._hermes_now().strftime('%Y%m%d_%H%M%S')}"
-    second = f"cron_{job['id']}_{scheduler._hermes_now().strftime('%Y%m%d_%H%M%S')}"
-    assert first != second
-    assert first.startswith("cron_abc123_") and second.startswith("cron_abc123_")
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "isolated test completed", "messages": []}
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+    fake = ModuleType("run_agent")
+    fake.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake)
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", lambda **_kw: {
+        "provider": "test", "api_key": "test-only", "base_url": "http://test.invalid",
+        "api_mode": "chat_completions",
+    })
+    monkeypatch.setattr(scheduler, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
+    job = _job(tmp_path)
+    for hour in (12, 13):
+        now = datetime(2026, 9, 16, hour)
+        monkeypatch.setattr(scheduler, "_hermes_now", lambda now=now: now)
+        success, _doc, _alert, error = scheduler.run_job(job)
+        assert success, error
+    assert len(observed) == 2 and observed[0] != observed[1]
+    assert all(sid.startswith(f"cron_{job['id']}_") for sid in observed)
 
 
 def test_stale_reuse_job_fails_closed_and_is_paused(tmp_path, monkeypatch):
@@ -104,8 +125,8 @@ def test_update_can_clear_a_stale_mode_but_not_request_one(tmp_path, monkeypatch
     assert jobs.job_has_retired_session_mode(jobs.get_job(created["id"])) is False
 
 
-def test_run_listing_uses_the_timestamped_prefix_range(tmp_path):
-    """Run listing returns per-tick sessions; there is no stable-root row to fold in."""
+def test_run_listing_preserves_retired_conversation_history(tmp_path):
+    """Execution is retired, but existing root history must remain discoverable."""
     from hermes_state import SessionDB
 
     db = SessionDB(tmp_path / "state.db")
@@ -115,4 +136,5 @@ def test_run_listing_uses_the_timestamped_prefix_range(tmp_path):
 
     rows = db.list_cron_job_runs("job9")
     ids = {r["id"] for r in rows}
-    assert ids == {"cron_job9_20260916_120000", "cron_job9_20260916_130000"}
+    assert ids == {"cron_job9", "cron_job9_20260916_120000", "cron_job9_20260916_130000"}
+    db.close()
