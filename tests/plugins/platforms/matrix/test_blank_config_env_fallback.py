@@ -48,3 +48,12 @@ def test_explicit_env_beats_yaml_and_yaml_beats_default(monkeypatch):
     assert MatrixAdapter._extra_truthy(PlatformConfig(enabled=True, extra={}), "auto_thread", "MATRIX_AUTO_THREAD", "true") is True
     assert _extra_csv_set(PlatformConfig(enabled=True, extra={"free_response_rooms": []}),
                           "free_response_rooms", "MATRIX_FREE_RESPONSE_ROOMS") == set()
+
+
+def test_dm_auto_thread_reaches_runtime_config(monkeypatch):
+    from plugins.platforms.matrix.adapter import _apply_yaml_config, _env_truthy
+
+    monkeypatch.delenv("MATRIX_DM_AUTO_THREAD", raising=False)
+    _apply_yaml_config({}, {"dm_auto_thread": True})
+    # Exercise the same env reader the adapter constructor currently uses.
+    assert _env_truthy("MATRIX_DM_AUTO_THREAD", "false") is True
