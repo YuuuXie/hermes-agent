@@ -375,6 +375,50 @@ stopwatch kill from other failures without parsing text: `timeout_seconds`
 first request, `after_llm_calls` otherwise). All three are `null` on
 non-timeout errors.
 
+### Partial results on timeout
+
+A timed-out child has usually already completed real work. The result entry keeps
+`status: "timeout"` and `summary: null` — a timeout is never reported as a completed
+result — but it additionally carries evidence of what the child got done:
+
+- `partial: true` + `partial_output_tail` — up to 8 completed tool results, 600 chars
+  each. Only `role: "tool"` messages are read, so the child's reasoning / private
+  chain-of-thought is never surfaced. Each preview is passed through the redactor
+  **before** truncation, so a credential cannot be split at the 600-char boundary into
+  an unrecognisable (and therefore unredacted) fragment. If redaction cannot be
+  guaranteed the entire tail is dropped rather than risk an unredacted preview.
+- `child_session_id` — the child's session, for reading its full transcript.
+- `files_written` — files the child actually wrote; they survive its timeout.
+- `worktree` — the child's isolated worktree/branch, when worktree isolation is on.
+
+The same tail and references are rendered in the background/`async` re-injection text,
+explicitly labelled as partial evidence rather than a result.
+
+A worker that is still alive when its deadline fires stays **quarantined**, not
+released: it keeps its credential lease and registry slot until its own worker actually
+exits. Never start a retry against a quarantined child.
+
+### Near-deadline handoff
+
+When a hard cap is configured, the child is steered **once** shortly before the wall to
+write a handoff record (completed work, remaining work, test receipts) into its
+workspace:
+
+```yaml
+delegation:
+  child_timeout_seconds: 1800
+  handoff_grace_seconds: 300   # default: 300; 0 disables
+```
+
+The cutoff is measured *backwards* from the existing deadline and is clamped to half the
+timeout — it **never extends** the deadline and never adds a wait. It is inert when
+`child_timeout_seconds` is `0`.
+
+Delivery is best-effort: the instruction lands through the ordinary steering path, at the
+child's next iteration boundary. A child stuck deep inside a long tool call may have no
+boundary left and never see it. That is why the artifact references above are attached
+independently and work with or without the instruction landing.
+
 ## Failure Visibility
 
 A subagent that fails — non-retryable provider error (404/400), timeout, crash, or no usable output — is never silent:

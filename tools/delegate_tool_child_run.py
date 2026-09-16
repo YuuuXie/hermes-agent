@@ -25,6 +25,17 @@ from tools.delegate_tool_results import (
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
+# Near-deadline handoff instruction. Deliberately asks only for a WRITTEN record in the workspace: it must not start
+# new work with minutes left, and it must not claim completion. The child keeps working after writing it.
+_HANDOFF_STEER_TEXT = (
+    "[RUNTIME NOTICE — approaching your hard time limit] Your execution deadline is near and this turn may be cut "
+    "off without warning. Before doing anything else, write a handoff file into your workspace (e.g. HANDOFF.md) "
+    "containing: (1) what you actually COMPLETED, with file paths and commit SHAs; (2) what REMAINS, as concrete "
+    "next steps; (3) TEST RECEIPTS — the exact commands you ran and their real results, or an explicit statement "
+    "that you ran none. Do not start new work and do not claim anything you did not verify. After the file is "
+    "written you may continue, but keep it up to date. This notice is sent once."
+)
+
 def _num(value: Any, default: int = 0) -> int:
     """int() for counters that may be mocks/None on test doubles."""
     return int(value) if isinstance(value, (int, float)) else default
@@ -647,6 +658,7 @@ class _ChildRun:
     parent_reads_snapshot: list = field(default_factory=list)
     abandoned_future: Any = None
     cleanup_done: threading.Event = field(default_factory=threading.Event)
+    child_timeout_for_log: Any = None
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -663,6 +675,11 @@ class _ChildRun:
         if info is None:
             return entry_dict
         from tools import subagent_worktree
+        if entry_dict.get("worker_still_running"):
+            entry_dict["worktree"] = subagent_worktree.unproven_worktree_payload(
+                info, "worker still running/quarantined; inspection deferred",
+            )
+            return entry_dict
         try:
             entry_dict["worktree"] = subagent_worktree.finalize_subagent_worktree(info)
         except Exception as e:
@@ -699,16 +716,85 @@ class _ChildRun:
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
 
     def finish_failed(
-        self, entry: Dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "", status: Optional[str] = None,
+        self, entry: Dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "",
+        status: Optional[str] = None, output_tail: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
-        the steer text that won the race with the failure, report the worktree."""
-        _safe_progress(
-            self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
-            duration_seconds=entry["duration_seconds"], summary=summary,
-        )
+        the steer text that won the race with the failure, report the worktree.
+
+        ``output_tail`` carries the already-redacted partial evidence of a timed-out child so surfaces watching the
+        progress relay see the same tail the result entry carries. ``summary`` stays empty: a failed child has NOT
+        produced a summary and must never be rendered as if it completed."""
+        complete_kwargs: Dict[str, Any] = {
+            "preview": preview, "status": status or entry["status"],
+            "duration_seconds": entry["duration_seconds"], "summary": summary,
+        }
+        if output_tail:
+            complete_kwargs["output_tail"] = output_tail
+        _safe_progress(self.child_progress_cb, "subagent.complete", **complete_kwargs)
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
+
+    def send_handoff_steer(self) -> bool:
+        """Queue the near-deadline handoff instruction into the child EXACTLY ONCE, via the ordinary
+        ``steer_subagent`` path (AIAgent.steer → applied at the child's next iteration boundary).
+
+        Best-effort by construction: if the child is deep inside a long tool call there may be no remaining
+        iteration boundary for the text to land on, and the steer is simply lost. That is why the durable artifact
+        references attached to the timeout entry (worktree, child_session_id, files_written) are a SEPARATE fallback
+        that works without this instruction. The parent does not need to be awake: this fires from the wait loop the
+        parent thread is already sitting in, and never blocks it."""
+        if not self.subagent_id:
+            return False
+        try:
+            from tools.delegate_tool_registry import steer_subagent
+            landed = bool(steer_subagent(self.subagent_id, _HANDOFF_STEER_TEXT))
+        except Exception:
+            logger.warning("near-deadline handoff steer failed for %s", self.subagent_id, exc_info=True)
+            return False
+        logger.warning(
+            "Subagent %d near its %ss deadline: handoff instruction %s",
+            self.task_index, self.child_timeout_for_log, "queued" if landed else "REJECTED (child finishing)",
+        )
+        return landed
+
+    def collect_partial_output_tail(self) -> List[Dict[str, Any]]:
+        """Bounded, redacted tail of the timed-out child's COMPLETED tool results (8 × 600 chars).
+
+        The Future never returned, so the child's transcript is read from its live ``_session_messages`` list.  Only
+        ``role == "tool"`` messages are read by ``_extract_output_tail``, so raw assistant reasoning / private
+        chain-of-thought is never surfaced.  ``fail_closed=True``: evidence from a FAILED child is a security
+        boundary, so an unverifiable redaction drops the whole tail rather than risk an unredacted preview.  Any
+        failure here degrades to the legacy timeout schema and never raises."""
+        try:
+            session_messages = getattr(self.child, "_session_messages", None)
+            if not isinstance(session_messages, list):
+                return []
+            return [
+                item
+                for item in _extract_output_tail(
+                    {"messages": list(session_messages)}, max_entries=8, max_chars=600, fail_closed=True,
+                )
+                if isinstance(item, dict) and isinstance(item.get("preview"), str) and item["preview"].strip()
+            ]
+        except Exception:
+            # Handling an existing timeout: never turn observability damage into a new error or an unredacted leak.
+            logger.warning("Failed to extract redacted delegated timeout output; dropping output tail", exc_info=True)
+            return []
+
+    def attach_artifact_refs(self, entry: Dict[str, Any]) -> None:
+        """Point the parent at the timed-out child's DURABLE work: its session id (transcript), and the files it
+        wrote. The worktree/branch is attached separately by ``attach_worktree``. These references are the fallback
+        path for a handoff instruction that never landed, so they must work on their own."""
+        with _quiet("timeout artifact refs failed", exc_info=True):
+            session_id = getattr(self.child, "session_id", None)
+            if isinstance(session_id, str) and session_id:
+                entry["child_session_id"] = session_id
+        with _quiet("timeout file-write refs failed", exc_info=True):
+            writes = file_state.writes_since("", self.wall_start, []) or {}
+            written = sorted({p for tid, paths in writes.items() if tid == self.child_task_id for p in paths})[:40]
+            if written:
+                entry["files_written"] = written
 
     def close_steering(self) -> Optional[str]:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
@@ -731,10 +817,13 @@ class _ChildRun:
         via a Future done-callback (``close_deferred=True``) — closing here would race its still-unwinding finally
         path.
         """
-        from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
+        from tools.delegate_tool import (
+            _get_child_timeout, _get_handoff_grace_seconds, _get_subagent_approval_callback, _set_subagent_approval_cb,
+        )
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
+        self.child_timeout_for_log = child_timeout
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )
@@ -754,6 +843,14 @@ class _ChildRun:
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         timeout_deadline = time.monotonic() + child_timeout if child_timeout is not None else None
+        # Near-deadline handoff cutoff, measured BACKWARDS from the existing hard deadline: this never extends the
+        # wait. Clamped to half the timeout so a grace >= the timeout cannot fire before the child has done anything.
+        handoff_deadline: Optional[float] = None
+        if timeout_deadline is not None and child_timeout is not None:
+            grace = _get_handoff_grace_seconds()
+            if grace is not None and grace > 0:
+                handoff_deadline = timeout_deadline - min(float(grace), child_timeout / 2.0)
+        handoff_sent = False
         stale_watchdog = False
         try:
             while True:
@@ -762,12 +859,19 @@ class _ChildRun:
                 if release_stale_wait and heartbeat.stale.is_set():
                     stale_watchdog = True
                     raise FuturesTimeoutError()
+                if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                    raise FuturesTimeoutError()
+                if handoff_deadline is not None and not handoff_sent and time.monotonic() >= handoff_deadline:
+                    handoff_sent = True  # exactly once, whether or not the steer lands
+                    self.send_handoff_steer()
                 wait_seconds = 0.5
                 if timeout_deadline is not None:
                     remaining = timeout_deadline - time.monotonic()
                     if remaining <= 0:
                         raise FuturesTimeoutError()
                     wait_seconds = min(wait_seconds, remaining)
+                if handoff_deadline is not None and not handoff_sent:
+                    wait_seconds = min(wait_seconds, max(0.0, handoff_deadline - time.monotonic()))
                 try:
                     return future.result(timeout=wait_seconds), None, False
                 except FuturesTimeoutError:
@@ -845,8 +949,24 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
+        if is_timeout:
+            _error_entry["worker_still_running"] = close_deferred
+            _error_entry["worker_state"] = "quarantined" if close_deferred else "exited"
+        # A timed-out child may already have completed useful tool calls. Attach that bounded, redacted evidence plus
+        # pointers to its durable artifacts. Ordinary exceptions keep the existing error schema untouched.
+        partial_output_tail: List[Dict[str, Any]] = []
+        if is_timeout:
+            partial_output_tail = self.collect_partial_output_tail()
+            if partial_output_tail:
+                _error_entry["partial"] = True
+                _error_entry["partial_output_tail"] = partial_output_tail
+            self.attach_artifact_refs(_error_entry)
+        self.finish_failed(
+            _error_entry, _late_pending_steer,
+            preview=f"Timed out after {duration}s" if is_timeout else str(exc),
+            output_tail=partial_output_tail or None,
+        )
         if close_deferred:
             self.abandoned_future = future
             _drain_after_timeout(child, future)

@@ -47,11 +47,23 @@ def _looks_like_error_output(content: Any) -> bool:
     first = content.splitlines()[0].strip().lower() if content.splitlines() else ""
     return first.startswith(("error:", "failed:", "traceback ", "exception:"))
 
-def _extract_output_tail(result: Dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000) -> List[Dict[str, Any]]:
+def _extract_output_tail(
+    result: Dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000, fail_closed: bool = False,
+) -> List[Dict[str, Any]]:
     """Last N tool-call results ``{tool, preview, is_error}`` from a child's conversation (the overlay's "Output"
     section), chronological order. Content blocks are flattened first so a block-wrapped "Error: ..." is still
     flagged; line structure is preserved (capped at ``max_chars``) so the overlay shows real output rather than a
-    whitespace-collapsed blob."""
+    whitespace-collapsed blob.
+
+    Only ``role == "tool"`` messages are read, so assistant reasoning/chain-of-thought never reaches a preview.
+
+    Tool output is redacted BEFORE truncation so a credential cannot be split at the ``max_chars`` boundary into an
+    unrecognisable — and therefore unredacted — fragment.
+
+    ``fail_closed`` controls what happens if the redactor itself raises. The default (False) is best-effort: that
+    single tool result is skipped and the rest of the tail still renders, so a redactor hiccup cannot blank the whole
+    ordinary Output overlay. Callers surfacing evidence from a *failed* child — where the entry is a security
+    boundary rather than a display nicety — pass True to drop the entire tail instead."""
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
         return []
@@ -68,7 +80,19 @@ def _extract_output_tail(result: Dict[str, Any], *, max_entries: int = 12, max_c
             continue
         content = _stringify_tool_content(msg.get("content") or "")
         tool_name = name_by_call_id.get(msg.get("tool_call_id") or "", "tool")
-        tail.append({"tool": tool_name, "preview": content[:max_chars], "is_error": _looks_like_error_output(content)})
+        try:
+            from agent.redact import redact_sensitive_text
+            safe_content = redact_sensitive_text(content, force=True)
+        except Exception:
+            if fail_closed:
+                # Security-boundary caller (timeout evidence): never emit a possibly-unredacted preview.
+                logger.warning("Failed to redact delegated tool output; dropping output tail", exc_info=True)
+                return []
+            # Display caller (ordinary Output overlay): skip only this entry. Blanking the whole section because one
+            # result could not be redacted would turn a redactor hiccup into a total loss of a working feature.
+            logger.warning("Failed to redact delegated tool output; skipping this entry", exc_info=True)
+            continue
+        tail.append({"tool": tool_name, "preview": safe_content[:max_chars], "is_error": _looks_like_error_output(content)})
     tail.reverse()
     return tail
 
