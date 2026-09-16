@@ -911,6 +911,42 @@ From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and 
 - Fan-out/fan-in patterns where one job aggregates results from several others
 - Recurring scouts/monitors that should dedupe against their own previous report (`continuity=true`)
 
+## Reusable cron sessions (`--session-mode reuse`)
+
+`continuity` re-injects the previous run's *output text*. To resume the persisted conversation
+(including retained tool turns and compression summaries), explicitly opt into reuse:
+
+```bash
+hermes cron create "every 6h" "Check the local queue; report only new items." \
+  --name "queue check" --session-mode reuse --deliver local --paused
+```
+
+- **`fresh` (default, unchanged)** — every tick runs in its own `cron_<job_id>_<timestamp>` session.
+  Prompts must be self-contained. Nothing about existing jobs changes.
+- **`reuse`** — every tick runs in one stable, cron-owned `cron_<job_id>` session and continues its
+  transcript.
+
+Details that matter:
+
+- The reused session is **cron-owned**. Cron never executes inside your interactive/chat session;
+  there is no "inject into session X" mode. Your own sessions are untouched.
+- History loads **after** acquiring the existing cross-process session turn lease, including
+  the first fire before a transcript exists. A busy session refuses this fire instead of
+  waiting with a stale prompt; the next scheduled fire reads the current job definition.
+- Reuse requires SQLite persistence and enabled automatic compression. Only the active
+  compression tip is loaded, without archived or ancestor history. Existing compaction and
+  context-limit guards remain in force; archived audit data may still grow on disk.
+- Each fire keeps its own execution id and status in `hermes cron runs <job_id>`. The shared
+  conversation remains open across fires; it is not an execution ledger row.
+- Pauses and emergency stop still gate dispatch. Prompt edits apply to later fires, not by
+  rewriting past messages. No cross-chat prompt injection or stop propagation is added.
+- Profiles are isolated: the same job id under a different `HERMES_HOME` is a different `state.db`
+  row and a different lease.
+- `--session-mode` is a user-owned flag (like `--model`): the agent's `cronjob` tool cannot opt its
+  own jobs into a durable conversation. Use the CLI or the job store.
+- `hermes cron edit <job_id> --session-mode fresh` switches back at any time; the old reused session
+  is simply left behind.
+
 ## Provider recovery
 
 Cron jobs inherit your configured fallback providers and credential pool rotation. If the primary API key is rate-limited or the provider returns an error, the cron agent can:

@@ -241,6 +241,12 @@ def admit_durable_turn_lease(
     fails; the caller returns it verbatim."""
     db = getattr(agent, "_session_db", None)
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
+    load_durable_history = getattr(agent, "_load_durable_history_on_admission", False) is True
+    if load_durable_history and (
+        db is None or getattr(agent, "_persist_disabled", False)
+        or not callable(getattr(type(db), "acquire_session_turn_lease", None))
+    ):
+        raise RuntimeError("Reusable cron sessions require durable persistence with turn leases")
     if db is None or not session_id:
         return admission
     # A fresh session id has no durable transcript to race over, and callers may supply an
@@ -248,12 +254,14 @@ def admit_durable_turn_lease(
     # MagicMock-style shims accept any attribute without the protocol.
     if (
         getattr(agent, "_persist_disabled", False)
-        or not _durable_session_exists(db, session_id)
+        or (not load_durable_history and not _durable_session_exists(db, session_id))
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
-    # Row proven to exist — suppress the redundant create attempt.
-    agent._session_db_created = True
+    # Reusable cron roots need admission even BEFORE their first row exists. The ordinary
+    # persistence path creates the row with full model/prompt metadata under this lease.
+    if not load_durable_history:
+        agent._session_db_created = True
     holder = (
         f"pid={os.getpid()}:turn={relay_turn_id}:platform={task_context['platform'] or 'unknown'}"
     )
@@ -270,7 +278,10 @@ def admit_durable_turn_lease(
         )
 
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS,
+        # Cron must not wait with a captured prompt while the operator edits/pauses the job.
+        # Refuse this fire; the next scheduled fire re-reads the current job definition.
+        wait_seconds=0 if load_durable_history else LEASE_WAIT_SECONDS,
         on_wait=_on_wait, should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
@@ -281,12 +292,27 @@ def admit_durable_turn_lease(
     lease = DurableTurnLease(agent, db, session_id, holder)
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+    # Cron's reusable session (``session_mode: reuse``) owns no in-memory transcript between
+    # ticks: the caller deliberately supplies no history and asks for the durable one to be
+    # loaded HERE, i.e. only after this process holds the session turn lease. Reading it in the
+    # scheduler instead would race a concurrent holder's flush. See cron/scheduler.py.
     try:
-        if waited:
-            agent._emit_status("Session is free; loading the latest transcript...")
-            # The holder may have compressed/rotated the session while we waited: reload only
-            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
-            latest_session_id = db.resolve_resume_session_id(session_id)
+        if waited or load_durable_history:
+            if waited:
+                agent._emit_status("Session is free; loading the latest transcript...")
+            # Cron follows ONLY compression descendants, not arbitrary continuations/forks.
+            latest_session_id = (
+                db.get_compression_tip(session_id) or session_id
+                if load_durable_history else db.resolve_resume_session_id(session_id)
+            )
+            if load_durable_history:
+                for sid in {session_id, latest_session_id}:
+                    row = db.get_session(sid)
+                    if row and row.get("source") != "cron":
+                        raise RuntimeError("Reusable cron session is not cron-owned")
+                agent._session_db_created = db.get_session(latest_session_id) is not None
+                if agent._session_db_created:
+                    db.reopen_session(latest_session_id)
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id

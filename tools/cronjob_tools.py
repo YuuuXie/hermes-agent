@@ -610,6 +610,9 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
+            # CLI-only lane too: a reused cron session is a durable, user-visible conversation,
+            # so the agent may not silently opt its own jobs into it (same rule as `model`).
+            session_mode=a["session_mode"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -814,6 +817,9 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
+    if a.get("session_mode") is not None:
+        # update_job() validates the vocabulary; '' clears back to the fresh default.
+        updates["session_mode"] = _normalize_optional_job_value(a["session_mode"])
     if a["no_agent"] is not None:
         # Flipping to True needs a script on the job or in this same update.
         target_no_agent = bool(a["no_agent"])
@@ -955,6 +961,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    session_mode: Optional[str] = None,
     all: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,

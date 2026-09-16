@@ -1643,6 +1643,28 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+_SESSION_MODE_ALIASES = {
+    "": "fresh", "new": "fresh", "fresh": "fresh", "isolated": "fresh",
+    "reuse": "reuse", "reused": "reuse", "continue": "reuse", "continuation": "reuse",
+}
+
+
+def _normalize_session_mode(value: Any) -> Optional[str]:
+    """Normalize the per-job cron execution-session mode.
+
+    ``None`` means "not set" and is stored as an absent key so pre-feature jobs stay
+    byte-identical; the scheduler treats absent/``fresh`` identically. This is NOT
+    ``continuity`` (which only injects the previous run's OUTPUT into the next prompt) —
+    ``reuse`` continues the cron-owned session transcript itself.
+    """
+    if value is None:
+        return None
+    mode = str(value).strip().lower()
+    if mode not in _SESSION_MODE_ALIASES:
+        raise ValueError("session_mode must be one of: fresh, reuse")
+    return _SESSION_MODE_ALIASES[mode]
+
+
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1657,12 +1679,14 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "session_mode": _normalize_session_mode,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "session_mode": _normalize_session_mode,
 }
 
 
@@ -1776,13 +1800,16 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    session_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
     script: stdout is injected as prompt context, or with ``no_agent=True`` IS the job (stdout
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
-    injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
+    injected. session_mode: ``fresh`` (default, one visible session per tick) or ``reuse``
+    (one stable cron-owned session per job whose transcript each tick continues).
+    workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
     if not isinstance(paused, bool):
@@ -1871,7 +1898,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
-        ("failure_deliver", f["failure_deliver"]),
+        ("failure_deliver", f["failure_deliver"]), ("session_mode", f["session_mode"]),
     ):
         if value is not None:
             job[key] = value
