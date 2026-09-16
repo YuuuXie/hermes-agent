@@ -65,7 +65,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     )
     cron_create.add_argument("--session-mode",
         choices=("fresh", "reuse"),
-        help="Execution session for this job: 'fresh' (default) starts a new session each tick; 'reuse' keeps one cron-owned session per job and continues its transcript. Unlike --continuity (which only re-injects the previous run's output text) reuse carries the whole conversation.",
+        help="Execution session for this job: 'reuse' (new-agent-job default) continues one cron-owned conversation; 'fresh' starts a new session each tick. Existing jobs are unchanged. Unlike --continuity (which only re-injects the previous run's output text) reuse carries the whole conversation.",
     )
     cron_create.add_argument("--model",
         help="Pin this job to a specific inference model (user-owned; the "

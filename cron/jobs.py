@@ -1652,8 +1652,8 @@ _SESSION_MODE_ALIASES = {
 def _normalize_session_mode(value: Any) -> Optional[str]:
     """Normalize the per-job cron execution-session mode.
 
-    ``None`` means "not set" and is stored as an absent key so pre-feature jobs stay
-    byte-identical; the scheduler treats absent/``fresh`` identically. This is NOT
+    ``None`` means "not set". Creation pins reuse for new agent jobs; reads and
+    updates leave legacy absent/``fresh`` records unchanged. This is NOT
     ``continuity`` (which only injects the previous run's OUTPUT into the next prompt) —
     ``reuse`` continues the cron-owned session transcript itself.
     """
@@ -1663,6 +1663,21 @@ def _normalize_session_mode(value: Any) -> Optional[str]:
     if mode not in _SESSION_MODE_ALIASES:
         raise ValueError("session_mode must be one of: fresh, reuse")
     return _SESSION_MODE_ALIASES[mode]
+
+
+def _validate_reuse_config(mode: Optional[str], no_agent: bool) -> None:
+    """Reject known incompatible configuration before scheduling; DB failures remain fire-time errors."""
+    if mode != "reuse" or no_agent:
+        return
+    from hermes_cli.config_effective import load_user_config_effective
+
+    cfg = (load_user_config_effective() or {}).get("compression", {})
+    cfg = cfg if isinstance(cfg, dict) else {}
+    # Match the agent's compression flag parser, including string values and its enabled default.
+    if str(cfg.get("enabled", True)).lower() not in {"true", "1", "yes"}:
+        raise ValueError(
+            "Cron session reuse requires compression.enabled=true. Enable compression or "
+            "explicitly select session_mode='fresh' (--session-mode fresh). No job change was saved.")
 
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
@@ -1807,8 +1822,8 @@ def create_job(
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
     script: stdout is injected as prompt context, or with ``no_agent=True`` IS the job (stdout
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
-    injected. session_mode: ``fresh`` (default, one visible session per tick) or ``reuse``
-    (one stable cron-owned session per job whose transcript each tick continues).
+    injected. session_mode: ``reuse`` (creation default for agent jobs, one stable cron-owned
+    conversation) or ``fresh`` (independent per-tick sessions). Legacy absent keys stay fresh.
     workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
@@ -1832,6 +1847,11 @@ def create_job(
 
     raw = locals()
     f = {key: norm(raw[key]) for key, norm in _CREATE_FIELD_NORMALIZERS.items()}
+    # Pin the creation default on new agent jobs only. Legacy records without this key
+    # must keep fresh semantics on load/update, regardless of later default changes.
+    if f["session_mode"] is None and not f["no_agent"]:
+        f["session_mode"] = "reuse"
+    _validate_reuse_config(f["session_mode"], f["no_agent"])
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -2069,6 +2089,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
+        if {"session_mode", "no_agent"}.intersection(updates):
+            _validate_reuse_config(updated.get("session_mode"), bool(updated.get("no_agent")))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

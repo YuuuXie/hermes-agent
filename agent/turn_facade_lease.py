@@ -404,6 +404,12 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         "⏳ Another Hermes process kept this session busy too long. Your message was not "
         "processed - wait for the other process to finish, then send it again."
     )
+    cron_reuse = getattr(agent, "_load_durable_history_on_admission", False) is True
+    if cron_reuse:
+        timeout_msg = (
+            "Cron fire was not executed: another process owns this conversation. "
+            "The next scheduled fire will read the current job configuration; "
+            "no history was read and no concurrent turn was started.")
     logger.error("session turn lease wait timed out for %s", session_id)
     try:
         agent._emit_warning(timeout_msg)
@@ -414,7 +420,7 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
         "final_response": timeout_msg,
         **base,
         "failed": True,
-        "error": f"session_turn_lease_timeout:{session_id}",
+        "error": f"session_turn_lease_timeout:{session_id}" + (f": {timeout_msg}" if cron_reuse else ""),
         "failure_reason": "session_busy",
         "failure_retryable": True,
     }

@@ -6,7 +6,7 @@ import base64
 from unittest.mock import patch
 
 from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _MAX_TASK_IMAGES, _build_child_goal_message, _normalize_task_images
-from tools.delegate_tool_child_run import _ChildRun
+from tools.delegate_tool_child_run import _ChildRun, _Heartbeat
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABh6FO1AAAAABJRU5ErkJggg=="
@@ -84,7 +84,7 @@ def test_child_run_sends_multimodal_goal_turn(tmp_path):
     with patch("tools.delegate_tool_child_run._create_isolated_worktree", return_value=None), \
             patch("agent.image_routing.decide_image_input_mode", return_value="native"):
         run.seed_workspace()
-        result, failure, _ = run.await_child()
+        result, failure, _ = run.await_child(_Heartbeat(run.child, run.parent_agent, 0))
     assert failure is None and result["final_response"] == "ok"
     content = seen["user_message"]
     assert isinstance(content, list) and content[0]["type"] == "text"

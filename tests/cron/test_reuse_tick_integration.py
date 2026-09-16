@@ -187,7 +187,7 @@ def test_two_real_ticks_share_one_session_and_keep_distinct_execution_ids(cron_t
 
     jobs, sched, home = cron_tick_env["jobs"], cron_tick_env["sched"], cron_tick_env["home"]
     job = jobs.create_job(
-        "summarize the queue", "every 5m", name="reuse-job", session_mode="reuse",
+        "summarize the queue", "every 5m", name="reuse-job",
         deliver="local")
     job_id = job["id"]
     stable_id = f"cron_{job_id}"
@@ -233,9 +233,9 @@ def test_two_real_ticks_share_one_session_and_keep_distinct_execution_ids(cron_t
 
 
 def test_fresh_mode_still_gets_one_stamped_session_per_tick(cron_tick_env, monkeypatch):
-    """The default is untouched: two ticks, two separate stamped sessions, no history reuse."""
+    """Explicit fresh mode keeps two separate stamped sessions without history reuse."""
     jobs, sched, home = cron_tick_env["jobs"], cron_tick_env["sched"], cron_tick_env["home"]
-    job = jobs.create_job("do a thing", "every 5m", name="fresh-job", deliver="local")
+    job = jobs.create_job("do a thing", "every 5m", name="fresh-job", deliver="local", session_mode="fresh")
     job_id = job["id"]
 
     recorder = _Recorder()

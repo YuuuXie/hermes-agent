@@ -197,8 +197,8 @@ class TestAgentCloseMethod:
             agent._active_children_lock = threading.Lock()
             agent.client = None
 
-            child_1 = MagicMock()
-            child_2 = MagicMock()
+            child_1 = MagicMock(_delegate_worker_quarantined=False)
+            child_2 = MagicMock(_delegate_worker_quarantined=False)
             agent._active_children = [child_1, child_2]
 
             agent.close()
@@ -474,12 +474,16 @@ class TestDelegationCleanup:
         parent._active_children_lock = threading.Lock()
         child = MagicMock()
         child.session_id = "timed-out-child"
+        cleanup_finished = threading.Event()
+        child.close.side_effect = lambda *a, **k: cleanup_finished.set()
+        child._delegate_worker_quarantined = False
         child._delegate_saved_tool_names = ["tool1"]
         child.get_activity_summary.return_value = {"api_call_count": 1}
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # The contract is ownership AFTER a running turn times out, not thread-start latency.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 5.0)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
@@ -494,7 +498,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                assert release_child.wait(timeout=30), "test did not release the held worker"
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -526,9 +530,13 @@ class TestDelegationCleanup:
                 session_id=child.session_id,
             )
             relay_host.unregister_subagent.assert_not_called()
+            child.close.assert_not_called()
+            assert child in parent._active_children
+            assert child._delegate_worker_quarantined is True
 
             release_child.set()
             assert child_finished.wait(timeout=5)
+            assert cleanup_finished.wait(timeout=5)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,

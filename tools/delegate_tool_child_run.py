@@ -791,10 +791,14 @@ class _ChildRun:
             if isinstance(session_id, str) and session_id:
                 entry["child_session_id"] = session_id
         with _quiet("timeout file-write refs failed", exc_info=True):
-            writes = file_state.writes_since("", self.wall_start, []) or {}
-            written = sorted({p for tid, paths in writes.items() if tid == self.child_task_id for p in paths})[:40]
+            written = self._child_files_written()
             if written:
                 entry["files_written"] = written
+
+    def _child_files_written(self) -> List[str]:
+        """Paths the CHILD itself wrote since its wall start, from the file-state registry only
+        (no worktree scan — the worker may still be alive). Bounded; empty when the guard is off."""
+        return list(file_state.writes_by(self.child_task_id, self.wall_start))[:40]
 
     def close_steering(self) -> Optional[str]:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
@@ -1023,9 +1027,9 @@ class _ChildRun:
         _files_read: list = []
         with _quiet(None):
             _files_read = list(file_state.known_reads(self.child_task_id))[:40]
-        _files_written_map: dict = {}
+        _files_written: List[str] = []
         with _quiet(None):
-            _files_written_map = file_state.writes_since("", self.wall_start, [])  # all writes since wall_start
+            _files_written = self._child_files_written()  # child's own writes since wall_start
         complete_kwargs: Dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": entry["status"],
@@ -1036,7 +1040,7 @@ class _ChildRun:
             "reasoning_tokens": _num(getattr(child, "session_reasoning_tokens", 0)),
             "api_calls": _num(entry["api_calls"]),
             "files_read": _files_read,
-            "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
+            "files_written": _files_written,
             "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),
         }
         if entry.get("failure_reason"):

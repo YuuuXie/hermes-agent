@@ -16,7 +16,7 @@ Cron jobs can:
 - pause, resume, edit, trigger, and remove jobs
 - attach zero, one, or multiple skills to a job
 - deliver results back to the origin chat, local files, or configured platform targets
-- run in fresh agent sessions with the normal static tool list
+- run in cron-owned reusable conversations by default for new agent jobs, or explicit fresh sessions
 - run in **no-agent mode** — a script on a schedule, its stdout delivered verbatim, zero LLM involvement (see the [no-agent mode](#no-agent-mode-script-only-jobs) section below)
 - fire on **external events** — a webhook route with `cron_job` set fires the job the moment something happens (a PR gets feedback, a service posts an alert) instead of waiting for the next scheduled tick. See [Event-Triggered Cron Jobs](/user-guide/messaging/webhooks#event-triggered-cron-jobs).
 
@@ -346,7 +346,7 @@ On each tick Hermes:
 1. loads jobs from `~/.hermes/cron/jobs.json`
 2. checks `next_run_at` against the current time
 3. starts a fresh `AIAgent` session for each due job
-4. optionally injects one or more attached skills into that fresh session
+4. optionally injects one or more attached skills into the cron session
 5. runs the prompt to completion
 6. delivers the final response
 7. updates run metadata and the next scheduled time
@@ -914,17 +914,20 @@ From the CLI: `hermes cron create "every 6h" "Scan for news" --continuity`, and 
 ## Reusable cron sessions (`--session-mode reuse`)
 
 `continuity` re-injects the previous run's *output text*. To resume the persisted conversation
-(including retained tool turns and compression summaries), explicitly opt into reuse:
+(including retained tool turns and compression summaries), new agent jobs default to reuse.
+Creation stores this choice on the job; legacy jobs with no mode remain fresh. You can also
+select the mode explicitly:
 
 ```bash
 hermes cron create "every 6h" "Check the local queue; report only new items." \
   --name "queue check" --session-mode reuse --deliver local --paused
 ```
 
-- **`fresh` (default, unchanged)** — every tick runs in its own `cron_<job_id>_<timestamp>` session.
-  Prompts must be self-contained. Nothing about existing jobs changes.
-- **`reuse`** — every tick runs in one stable, cron-owned `cron_<job_id>` session and continues its
-  transcript.
+- **`fresh` (explicit opt-out, and legacy absent-key behavior)** — every tick runs in its own
+  `cron_<job_id>_<timestamp>` session. Prompts must be self-contained.
+- **`reuse` (new agent jobs)** — every tick continues one stable, cron-owned `cron_<job_id>`
+  conversation. No existing job is migrated; prompt edits do not change its stored mode.
+- Script-only (`no_agent`) jobs do not get a new conversation default.
 
 Details that matter:
 
@@ -942,8 +945,8 @@ Details that matter:
   rewriting past messages. No cross-chat prompt injection or stop propagation is added.
 - Profiles are isolated: the same job id under a different `HERMES_HOME` is a different `state.db`
   row and a different lease.
-- `--session-mode` is a user-owned flag (like `--model`): the agent's `cronjob` tool cannot opt its
-  own jobs into a durable conversation. Use the CLI or the job store.
+- `--session-mode` explicitly overrides the creation default through CLI/Python. The model-facing
+  tool has no new mode argument; it uses the same job-store default as other creation paths.
 - `hermes cron edit <job_id> --session-mode fresh` switches back at any time; the old reused session
   is simply left behind.
 
@@ -1131,7 +1134,7 @@ synchronous execution automatically.
 
 ## Toolsets available to cron jobs
 
-Cron runs each job in a fresh agent session with no chat platform attached. By default the cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun.
+Cron runs each job in its own agent session with no chat platform attached. By default the cron agent gets **the toolset you configured for the `cron` platform in `hermes tools`** — not the CLI default, not everything under the sun.
 
 ```bash
 hermes tools
@@ -1286,7 +1289,7 @@ The storage uses atomic file writes so interrupted writes do not leave a partial
 ## Self-contained prompts still matter
 
 :::warning Important
-Cron jobs run in a completely fresh agent session. The prompt must contain everything the agent needs that is not already provided by attached skills.
+New agent jobs continue their own cron conversation by default, never the creating chat. The initial prompt must contain everything the agent needs that is not already provided by attached skills. Jobs in fresh mode need a self-contained prompt on every run.
 :::
 
 **BAD:** `"Check on that server issue"`

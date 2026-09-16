@@ -196,6 +196,20 @@ class FileStateRegistry:
         with self._state_lock:
             return list(self._reads.get(task_id, {}).keys())
 
+    def writes_by(self, task_id: str, since_ts: float) -> List[str]:
+        """Sorted resolved paths last written by *task_id* at/after ``since_ts``.
+
+        The task/time-scoped counterpart of :meth:`writes_since` (which excludes a task and
+        needs an explicit candidate path set). Used to report a delegated child's own durable
+        output without scanning its worktree.
+        """
+        if _disabled():
+            return []
+        with self._state_lock:
+            return sorted(
+                p for p, (writer_tid, ts) in self._last_writer.items()
+                if writer_tid == task_id and ts >= since_ts)
+
     def forget_task(self, task_id: str) -> None:
         """Release read stamps owned by a task after its lifecycle ends."""
         with self._state_lock:
@@ -243,6 +257,10 @@ def known_reads(task_id: str) -> List[str]:
     return _registry.known_reads(task_id)
 
 
+def writes_by(task_id: str, since_ts: float) -> List[str]:
+    return _registry.writes_by(task_id, since_ts)
+
+
 __all__ = [
     "FileStateRegistry",
     "get_registry",
@@ -251,4 +269,5 @@ __all__ = [
     "check_stale",
     "lock_path",
     "writes_since",
-    "known_reads"]
+    "known_reads",
+    "writes_by"]

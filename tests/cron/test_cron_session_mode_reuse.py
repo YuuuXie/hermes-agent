@@ -15,7 +15,7 @@ import pytest
 from hermes_state import SessionDB
 
 
-def test_store_cli_roundtrip_and_fresh_default(tmp_path, monkeypatch):
+def test_store_cli_roundtrip_and_creation_default(tmp_path, monkeypatch):
     import cron.jobs as jobs
     from hermes_cli.subcommands.cron import build_cron_parser
     from hermes_cli.cron import _job_api_kwargs
@@ -23,7 +23,7 @@ def test_store_cli_roundtrip_and_fresh_default(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     plain = jobs.create_job("do a thing", "every 1h")
-    assert "session_mode" not in plain
+    assert plain["session_mode"] == "reuse"
     parser = argparse.ArgumentParser()
     build_cron_parser(parser.add_subparsers(dest="command"), cmd_cron=lambda args: 0)
     args = parser.parse_args(["cron", "create", "every 1h", "check queue", "--session-mode", "reuse"])
@@ -123,6 +123,9 @@ def test_cross_process_refusal_precedes_any_history_read(tmp_path, monkeypatch, 
                 result = _admit(_Agent(db))
                 assert result.lease is None
                 assert result.early_result["failure_reason"] == "session_busy"
+                assert result.early_result["failed"] is True  # not a successful/quietly skipped fire
+                assert "next scheduled" in result.early_result["final_response"]
+                assert "Your message" not in result.early_result["final_response"]
         # The same contender can enter after the foreign holder exits.
         admitted = _admit(_Agent(db))
         assert admitted.lease is not None
