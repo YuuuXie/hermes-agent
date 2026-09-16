@@ -610,8 +610,6 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
-            # CLI/Python override; the job store pins the creation default for every entrypoint.
-            session_mode=a["session_mode"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
@@ -816,9 +814,6 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
     if a["workdir"] is not None:
         # Empty string clears; otherwise update_job() validates/normalizes.
         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
-    if a.get("session_mode") is not None:
-        # update_job() validates the vocabulary; '' clears to legacy fresh behavior.
-        updates["session_mode"] = _normalize_optional_job_value(a["session_mode"])
     if a["no_agent"] is not None:
         # Flipping to True needs a script on the job or in this same update.
         target_no_agent = bool(a["no_agent"])
@@ -960,7 +955,6 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
-    session_mode: Optional[str] = None,
     all: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
@@ -1010,7 +1004,7 @@ CRONJOB_SCHEMA = {
 
 'resnap' adopts the CURRENT global inference resolution for an unpinned job (job_id) or all unpinned jobs (all=true) WITHOUT pinning it, so it keeps tracking future global changes — use after deliberately changing the default model.
 
-New agent jobs reuse their own cron conversation across runs; existing jobs keep their stored mode. They never inherit current-chat context, so initial prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1047,7 +1041,7 @@ New agent jobs reuse their own cron conversation across runs; existing jobs keep
             },
             "deliver": {
                 "type": "string",
-                "description": "Where the job's output is POSTED as a one-way message (the job runs in its own cron session, not the delivery chat). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
+                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
             },
             "failure_deliver": {
                 "type": "string",

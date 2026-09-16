@@ -461,6 +461,38 @@ NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "there is nothing for the job to run."
 )
 
+# The local cron-owned reusable-session feature was retired; cron always runs a job in its own
+# fresh per-tick session again. A job definition persisted while the feature existed may still
+# carry a non-fresh ``session_mode``. Such a job must FAIL CLOSED rather than silently run with
+# different (fresh) semantics than the operator configured: the reuse behaviour was chosen
+# deliberately, so the operator has to acknowledge the change by clearing the stored field.
+RETIRED_SESSION_MODE_ERROR = (
+    "This cron job requests a retired execution-session mode (cron-owned session reuse). "
+    "Reuse no longer exists; the job is NOT run as a fresh-session job automatically. "
+    "Clear the stored 'session_mode' field on the job definition (an update that sets it to "
+    "'fresh' or empty removes it), then resume the job. Use the native /goal, /loop or "
+    "/heartbeat conversation features if you still want a continuing conversation."
+)
+
+# Values that are equivalent to today's only behaviour (one session per tick); anything else is
+# a retired mode.
+_FRESH_SESSION_MODE_VALUES = frozenset({"", "fresh", "new", "isolated"})
+
+
+def job_has_retired_session_mode(job: Dict[str, Any]) -> bool:
+    """True when a stored job carries a session mode this build no longer implements."""
+    value = (job or {}).get("session_mode")
+    if value is None:
+        return False
+    return str(value).strip().lower() not in _FRESH_SESSION_MODE_VALUES
+
+
+def _normalize_retired_session_mode(value: Any) -> Optional[str]:
+    """Updates may only CLEAR the retired field; requesting a retired mode raises."""
+    if value is None or value is False or str(value).strip().lower() in _FRESH_SESSION_MODE_VALUES:
+        return None
+    raise ValueError(RETIRED_SESSION_MODE_ERROR)
+
 
 def job_payload_is_empty(job: Dict[str, Any]) -> bool:
     """True when a job record has nothing runnable (blank prompt, no script, no skills) AND at
@@ -1643,43 +1675,6 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
-_SESSION_MODE_ALIASES = {
-    "": "fresh", "new": "fresh", "fresh": "fresh", "isolated": "fresh",
-    "reuse": "reuse", "reused": "reuse", "continue": "reuse", "continuation": "reuse",
-}
-
-
-def _normalize_session_mode(value: Any) -> Optional[str]:
-    """Normalize the per-job cron execution-session mode.
-
-    ``None`` means "not set". Creation pins reuse for new agent jobs; reads and
-    updates leave legacy absent/``fresh`` records unchanged. This is NOT
-    ``continuity`` (which only injects the previous run's OUTPUT into the next prompt) —
-    ``reuse`` continues the cron-owned session transcript itself.
-    """
-    if value is None:
-        return None
-    mode = str(value).strip().lower()
-    if mode not in _SESSION_MODE_ALIASES:
-        raise ValueError("session_mode must be one of: fresh, reuse")
-    return _SESSION_MODE_ALIASES[mode]
-
-
-def _validate_reuse_config(mode: Optional[str], no_agent: bool) -> None:
-    """Reject known incompatible configuration before scheduling; DB failures remain fire-time errors."""
-    if mode != "reuse" or no_agent:
-        return
-    from hermes_cli.config_effective import load_user_config_effective
-
-    cfg = (load_user_config_effective() or {}).get("compression", {})
-    cfg = cfg if isinstance(cfg, dict) else {}
-    # Match the agent's compression flag parser, including string values and its enabled default.
-    if str(cfg.get("enabled", True)).lower() not in {"true", "1", "yes"}:
-        raise ValueError(
-            "Cron session reuse requires compression.enabled=true. Enable compression or "
-            "explicitly select session_mode='fresh' (--session-mode fresh). No job change was saved.")
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1694,14 +1689,14 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
-    "session_mode": _normalize_session_mode,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
-    "session_mode": _normalize_session_mode,
+    # Retired feature: an update may only CLEAR a stale stored mode (migration path).
+    "session_mode": _normalize_retired_session_mode,
 }
 
 
@@ -1815,16 +1810,13 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
-    session_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
     deliver defaults to "origin" when ``origin`` is given, else "local"; repeat None = forever.
     script: stdout is injected as prompt context, or with ``no_agent=True`` IS the job (stdout
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
-    injected. session_mode: ``reuse`` (creation default for agent jobs, one stable cron-owned
-    conversation) or ``fresh`` (independent per-tick sessions). Legacy absent keys stay fresh.
-    workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
+    injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
     if not isinstance(paused, bool):
@@ -1847,11 +1839,6 @@ def create_job(
 
     raw = locals()
     f = {key: norm(raw[key]) for key, norm in _CREATE_FIELD_NORMALIZERS.items()}
-    # Pin the creation default on new agent jobs only. Legacy records without this key
-    # must keep fresh semantics on load/update, regardless of later default changes.
-    if f["session_mode"] is None and not f["no_agent"]:
-        f["session_mode"] = "reuse"
-    _validate_reuse_config(f["session_mode"], f["no_agent"])
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -1918,7 +1905,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
-        ("failure_deliver", f["failure_deliver"]), ("session_mode", f["session_mode"]),
+        ("failure_deliver", f["failure_deliver"]),
     ):
         if value is not None:
             job[key] = value
@@ -2089,9 +2076,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
-        if {"session_mode", "no_agent"}.intersection(updates):
-            _validate_reuse_config(updated.get("session_mode"), bool(updated.get("no_agent")))
         _reject_terminal_activation(job, updated, job_id)
+        # Migration path for records stored by the retired reuse feature: an explicit update
+        # clearing the field removes the key entirely, restoring the pre-feature record shape.
+        if "session_mode" in updates and updates["session_mode"] is None:
+            updated.pop("session_mode", None)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
             _validate_job_mode_invariants(

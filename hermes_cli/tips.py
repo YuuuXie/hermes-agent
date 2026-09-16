@@ -166,7 +166,7 @@ TIPS = [
     "Cron delivery targets include telegram, discord, slack, email, sms, and 12+ more platforms.",
     "If a cron response starts with [SILENT], delivery is suppressed — useful for monitoring-only jobs.",
     "Cron supports relative delays (30m), intervals (every 2h), cron expressions, and ISO timestamps.",
-    "New cron agent jobs reuse their own conversation; --session-mode fresh opts out. Existing jobs are unchanged.",
+    "Cron jobs run in completely fresh agent sessions — prompts must be self-contained.",
     # --- Voice ---
     "Voice mode works with zero API keys if faster-whisper is installed (free local speech-to-text).",
     "Five TTS providers available: Edge TTS (free), ElevenLabs, OpenAI, NeuTTS (free local), MiniMax.",

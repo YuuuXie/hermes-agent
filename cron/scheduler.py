@@ -1575,31 +1575,6 @@ def _init_cron_mcp_tools(job_id: str) -> None:
         logger.warning("Job '%s': MCP initialization failed (non-fatal): %s", job_id, _mcp_exc)
 
 
-def cron_session_mode(job: dict) -> str:
-    """Execution-session mode for a job: ``fresh`` (default) or ``reuse``.
-
-    Absent/unknown values mean ``fresh`` so every pre-feature job keeps one visible session
-    per tick. ``reuse`` is strictly opt-in and only ever names a cron-OWNED session id
-    (``cron_<job_id>``); cron never executes inside a user's interactive session.
-    """
-    raw = str(job.get("session_mode") or "").strip().lower()
-    return "reuse" if raw in {"reuse", "reused", "continue", "continuation"} else "fresh"
-
-
-def _cron_execution_session_id(job: dict, job_id: str) -> str:
-    """Session id for this run.
-
-    ``fresh``: a new ``cron_<job_id>_<stamp>`` session per tick (unchanged default).
-    ``reuse``: the stable logical ``cron_<job_id>`` root. Admission follows compression
-    inside the profile-scoped DB. The per-run execution ledger id remains independent.
-    """
-    if cron_session_mode(job) != "reuse":
-        return f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
-    # No DB access here: both lineage resolution and history load belong under admission,
-    # using the DB opened inside the job's profile scope.
-    return f"cron_{job_id}"
-
-
 def _open_cron_session_db(job: dict):
     """Open the SQLite session store under its own timeout (HERMES_CRON_TIMEOUT only watches
     run_conversation). A wedged sqlite3.connect returns None (no session store) instead of
@@ -1844,23 +1819,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     return final_response
 
 
-def _finalize_cron_session(
-    session_db, agent, job_id: str, job_name: str, cron_session_id: str, *,
-    reuse_session: bool = False,
-) -> None:
-    """Title, classify, end and release the cron session after the agent turn has returned.
-
-    Reused conversations remain open; only the per-run execution ledger ends each fire.
-    """
-    # A reused conversation outlives this fire. The facade already released its turn lease;
-    # ending/retitling it here could race a successor (or mutate a refused holder's session).
-    # Per-fire completion stays in executions.db, not on the shared conversation row.
-    if reuse_session:
-        from hermes_state_registry import release_or_close
-        if agent is not None:
-            agent._end_session_on_close = False
-        release_or_close(_BoundedCronSessionDB(session_db, job_id))
-        return
+def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_session_id: str) -> None:
+    """Title, classify, end and release the cron session after the agent turn has returned."""
     # Bound every DB op so storage failure cannot hold the dispatch guard.
     _session_db = _BoundedCronSessionDB(session_db, job_id)
     # Compression may have rotated the run onto a continuation: finalize that, not the stale cron
@@ -1988,6 +1948,13 @@ def _prepare_job_prompt(
 
     if job_payload_is_empty(job):
         return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
+
+    # A job stored by the retired cron-owned session-reuse feature must not silently downgrade to
+    # fresh per-tick semantics: fail closed and auto-pause so the operator migrates it explicitly.
+    from cron.jobs import RETIRED_SESSION_MODE_ERROR, job_has_retired_session_mode
+
+    if job_has_retired_session_mode(job):
+        return _block_and_pause_job(job_id, job_name, RETIRED_SESSION_MODE_ERROR), None
 
     _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
@@ -2285,7 +2252,7 @@ def run_job(
         return early
     from run_agent import AIAgent
 
-    _cron_session_id = _cron_execution_session_id(job, job_id)
+    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -2311,21 +2278,9 @@ def run_job(
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
-        if cron_session_mode(job) == "reuse" and _session_db is None:
-            raise RuntimeError("Cron session reuse requires the SQLite session store")
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        if cron_session_mode(job) == "reuse":
-            # Load the prior cron transcript inside the session turn lease, not here: the lease
-            # is the only cross-process admission that keeps a second scheduler (another
-            # gateway, `hermes cron run`) from reading a half-flushed transcript. Compression
-            # keeps the reused session from growing without bound, and the reload follows the
-            # rotation tip.
-            agent._end_session_on_close = False
-            if getattr(agent, "compression_enabled", True) is False:
-                raise RuntimeError("Cron session reuse requires compression.enabled=true")
-            agent._load_durable_history_on_admission = True
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
@@ -2364,13 +2319,10 @@ def run_job(
     finally:
         from cron.scheduler_detached_worker import defer_teardown_to_running_worker
         _worker_teardown_deferred = defer_teardown_to_running_worker(
-            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id,
-            reuse_session=cron_session_mode(job) == "reuse")
+            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
-            _finalize_cron_session(
-                _session_db, agent, job_id, job_name, _cron_session_id,
-                reuse_session=cron_session_mode(job) == "reuse")
+            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held

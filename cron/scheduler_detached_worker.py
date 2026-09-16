@@ -15,8 +15,6 @@ from typing import Optional
 def defer_teardown_to_running_worker(
     future: Optional[concurrent.futures.Future], session_db, agent, job_id: str, job_name: str,
     cron_session_id: str,
-    *,
-    reuse_session: bool = False,
 ) -> bool:
     """Return True when the worker is still running and its Future will finalize the session
     and tear the agent down on completion; False when the caller must do it now."""
@@ -27,9 +25,7 @@ def defer_teardown_to_running_worker(
     def _finish(_future) -> None:
         try:
             if session_db:
-                _finalize_cron_session(
-                    session_db, agent, job_id, job_name, cron_session_id,
-                    **({"reuse_session": True} if reuse_session else {}))
+                _finalize_cron_session(session_db, agent, job_id, job_name, cron_session_id)
         finally:
             _teardown_cron_agent(agent, job_id)
 
