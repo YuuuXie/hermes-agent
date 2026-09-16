@@ -980,7 +980,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
-                        if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
+                        if (_is_session_expired(resp, ret, errcode)
+                                or ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) \
+                                and not retried_without_token and context_token:
                             retried_without_token, context_token = True, None
                             self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
                             logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))

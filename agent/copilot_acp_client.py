@@ -44,7 +44,9 @@ _ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant", "t
 # True/False is cached, so a CLI installed mid-session is picked up.
 _ACP_PROBE_CACHE: dict[str, bool] = {}
 _PROMPT_PREAMBLE = (
-    "You are being used as the active ACP agent backend for Hermes.",
+    "You are being used as the active ACP agent backend for Hermes Agent.",
+    "You are NOT running as GitHub Copilot CLI. You are running inside Hermes Agent, a full-featured AI assistant with scheduling, reminders, file management, terminal access, and many other capabilities.",
+    "The ONLY tools you have are the ones listed below in the 'Available tools' section. Trust that list — it is your ground truth. Do NOT claim you lack a tool if it appears in that list.",
     "Use ACP capabilities to complete tasks.",
     "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
     "If no tool is needed, answer normally.",

@@ -137,6 +137,9 @@ def _foreground_background_guidance(command: str) -> str | None:
     backgrounding (it should be a managed background session), else None."""
     if _looks_like_help_or_version_command(command):
         return None
+    # Package manager install/uninstall commands are never long-lived servers
+    if re.search(r"\bpip3?\s+(?:install|uninstall|download|wheel|hash|check)\b", command, re.IGNORECASE):
+        return None
     unquoted = _strip_quotes(command)
     return next((msg for hit, msg in _FOREGROUND_GUIDANCE if hit(unquoted)), None)
 
