@@ -675,6 +675,11 @@ class _ChildRun:
         if info is None:
             return entry_dict
         from tools import subagent_worktree
+        if entry_dict.get("worker_still_running"):
+            entry_dict["worktree"] = subagent_worktree.unproven_worktree_payload(
+                info, "worker still running/quarantined; inspection deferred",
+            )
+            return entry_dict
         try:
             entry_dict["worktree"] = subagent_worktree.finalize_subagent_worktree(info)
         except Exception as e:
@@ -854,6 +859,8 @@ class _ChildRun:
                 if release_stale_wait and heartbeat.stale.is_set():
                     stale_watchdog = True
                     raise FuturesTimeoutError()
+                if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                    raise FuturesTimeoutError()
                 if handoff_deadline is not None and not handoff_sent and time.monotonic() >= handoff_deadline:
                     handoff_sent = True  # exactly once, whether or not the steer lands
                     self.send_handoff_steer()
@@ -863,6 +870,8 @@ class _ChildRun:
                     if remaining <= 0:
                         raise FuturesTimeoutError()
                     wait_seconds = min(wait_seconds, remaining)
+                if handoff_deadline is not None and not handoff_sent:
+                    wait_seconds = min(wait_seconds, max(0.0, handoff_deadline - time.monotonic()))
                 try:
                     return future.result(timeout=wait_seconds), None, False
                 except FuturesTimeoutError:
@@ -940,6 +949,10 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        close_deferred = is_timeout and not future.done()
+        if is_timeout:
+            _error_entry["worker_still_running"] = close_deferred
+            _error_entry["worker_state"] = "quarantined" if close_deferred else "exited"
         # A timed-out child may already have completed useful tool calls. Attach that bounded, redacted evidence plus
         # pointers to its durable artifacts. Ordinary exceptions keep the existing error schema untouched.
         partial_output_tail: List[Dict[str, Any]] = []
@@ -954,7 +967,6 @@ class _ChildRun:
             preview=f"Timed out after {duration}s" if is_timeout else str(exc),
             output_tail=partial_output_tail or None,
         )
-        close_deferred = is_timeout and not future.done()
         if close_deferred:
             self.abandoned_future = future
             _drain_after_timeout(child, future)

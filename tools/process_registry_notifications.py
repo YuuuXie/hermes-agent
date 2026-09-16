@@ -185,7 +185,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     lines = _preamble(
         evt,
         f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-        f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
+        f"A background fan-out unit you dispatched earlier — {unit} — has reported; its outcomes are "
         "below. Any other units from the same delegate_task call report separately as they finish. You may have "
         "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
         "on siblings, end your turn after acting on this one.",
@@ -242,6 +242,11 @@ def _artifact_reference_lines(r: dict) -> list:
     """Durable pointers to a timed-out child's work: its session transcript and the files it wrote. These stand on
     their own when a near-deadline handoff instruction never landed."""
     lines = []
+    if r.get("worker_still_running"):
+        lines.append("Worker still running / quarantined at timeout. It may still write files; do not retry until cleanup.")
+    worktree = r.get("worktree") or {}
+    if worktree:
+        lines.append(f"Preserved worktree: {worktree.get('path')} (branch {worktree.get('branch')}); inspect before reuse.")
     sid = r.get("child_session_id")
     if sid:
         lines.append(f"Child session (full transcript): {sid}")
@@ -287,7 +292,7 @@ def _format_async_delegation(evt: dict) -> str:
     lines = _preamble(
         evt,
         f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
+        "A background subagent you dispatched earlier has reported an outcome. You may "
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
