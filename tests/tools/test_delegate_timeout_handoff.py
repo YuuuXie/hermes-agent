@@ -195,6 +195,7 @@ class _HeldChild:
         ]
         self.started = threading.Event()
         self.release = threading.Event()
+        self.closed = threading.Event()
         self.steers: list = []
 
     def run_conversation(self, **_kwargs):
@@ -207,13 +208,14 @@ class _HeldChild:
         return True
 
     def hard_interrupt(self, _reason=None):
-        self.release.set()
+        # Blocking tool I/O does not exit merely because a cooperative stop was requested.
+        pass
 
     def get_activity_summary(self):
         return {"api_call_count": 1}
 
     def close(self):
-        self.release.set()
+        self.closed.set()
 
 
 def _run_child_to_timeout(monkeypatch, *, timeout: float, grace):
@@ -232,8 +234,13 @@ def _run_child_to_timeout(monkeypatch, *, timeout: float, grace):
         entry = delegate_tool._run_single_child(
             task_index=0, goal="held worker", child=child, parent_agent=parent,
         )
+        assert entry["worker_still_running"] is True
+        assert entry["worker_state"] == "quarantined"
+        assert child in parent._active_children
+        child._credential_pool.release_lease.assert_not_called()
     finally:
         child.release.set()
+        assert child.closed.wait(3), "deferred cleanup did not finish"
     return child, entry
 
 
