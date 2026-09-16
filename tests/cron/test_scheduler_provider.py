@@ -20,6 +20,25 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture
+def ticker_startup_complete(monkeypatch):
+    """Observe real recovery startup separately from the ticker-loop budget."""
+    from cron.scheduler_provider import CronScheduler
+    ready = threading.Event()
+    original = CronScheduler.recover_interrupted
+
+    def recover(self):
+        try:
+            return original(self)
+        finally:
+            ready.set()
+
+    monkeypatch.setattr(CronScheduler, "recover_interrupted", recover)
+    return ready
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -39,7 +58,7 @@ def _wait_until(predicate, timeout=10.0, interval=0.005):
     return predicate()
 
 
-def test_ticker_calls_tick_at_least_once_then_stops():
+def test_ticker_calls_tick_at_least_once_then_stops(ticker_startup_complete):
     """The gateway in-process ticker loop calls cron.scheduler.tick repeatedly
     and exits promptly once the stop_event is set."""
     from gateway.run import _start_cron_ticker
@@ -60,9 +79,12 @@ def test_ticker_calls_tick_at_least_once_then_stops():
             daemon=True,
         )
         t.start()
-        assert _wait_until(lambda: len(calls) >= 1), "ticker never called tick()"
-        stop.set()
-        t.join(timeout=5)
+        try:
+            assert ticker_startup_complete.wait(30), "ticker startup recovery did not finish"
+            assert _wait_until(lambda: len(calls) >= 1), "ticker never called tick()"
+        finally:
+            stop.set()
+            t.join(timeout=5)
 
     assert not t.is_alive(), "ticker did not exit after stop_event was set"
     assert len(calls) >= 1, "ticker never called tick()"
@@ -71,7 +93,7 @@ def test_ticker_calls_tick_at_least_once_then_stops():
     assert calls[0].get("sync") is False
 
 
-def test_desktop_ticker_calls_tick_then_stops():
+def test_desktop_ticker_calls_tick_then_stops(ticker_startup_complete):
     """The desktop dashboard ticker loop calls cron.scheduler.tick and exits
     once the stop_event is set. Desktop has no live adapters, so it ticks with
     no adapters/loop."""
@@ -92,9 +114,12 @@ def test_desktop_ticker_calls_tick_then_stops():
             daemon=True,
         )
         t.start()
-        assert _wait_until(lambda: len(calls) >= 1), "desktop ticker never called tick()"
-        stop.set()
-        t.join(timeout=5)
+        try:
+            assert ticker_startup_complete.wait(30), "desktop ticker startup recovery did not finish"
+            assert _wait_until(lambda: len(calls) >= 1), "desktop ticker never called tick()"
+        finally:
+            stop.set()
+            t.join(timeout=5)
 
     assert not t.is_alive(), "desktop ticker did not exit after stop_event was set"
     assert len(calls) >= 1, "desktop ticker never called tick()"
@@ -162,7 +187,7 @@ def test_force_fire_capability_detects_legacy_override():
     assert KeywordSink().supports_force_fire is True
 
 
-def test_inprocess_provider_ticks_and_stops():
+def test_inprocess_provider_ticks_and_stops(ticker_startup_complete):
     """The built-in provider drives cron.scheduler.tick(sync=False) on a loop
     and exits promptly when stop_event is set — same contract as the raw
     ticker characterized above."""
@@ -178,12 +203,12 @@ def test_inprocess_provider_ticks_and_stops():
             target=prov.start, args=(stop,), kwargs={"interval": 0}, daemon=True
         )
         t.start()
-        # Wait for the loop to actually call tick() at least once rather than
-        # sleeping a fixed window — under loaded CI the worker thread may not be
-        # scheduled within a short sleep, which made this flake (assert 0 >= 1).
-        assert _wait_until(lambda: len(calls) >= 1), "provider never called tick()"
-        stop.set()
-        t.join(timeout=5)
+        try:
+            assert ticker_startup_complete.wait(30), "provider startup recovery did not finish"
+            assert _wait_until(lambda: len(calls) >= 1), "provider never called tick()"
+        finally:
+            stop.set()
+            t.join(timeout=5)
 
     assert not t.is_alive(), "provider did not exit after stop_event was set"
     assert len(calls) >= 1, "provider never called tick()"

@@ -1108,19 +1108,60 @@ creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api
 dt._build_child_agent = build; dt._run_single_child = child; dt._resolve_delegation_credentials = lambda *a, **k: creds
 dt.delegate_task(tasks=[{"goal": "fast member of the group task", "group": "g"},
                         {"goal": "slow member of the group task", "group": "g"}], background=True, parent_agent=parent)
-time.sleep(2.0)
-sys.stdout.flush(); os._exit(1)
+# Crash only AFTER the fast result is committed, not after an arbitrary sleep.
+import json, sqlite3
+from pathlib import Path
+conn = sqlite3.connect((Path(os.environ["HERMES_HOME"]) / "state.db").as_uri() + "?mode=ro", uri=True)
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    rows = conn.execute("SELECT result_json FROM async_delegations").fetchall()
+    if any(item.get("task_index") == 0 and item.get("status") == "completed"
+           for row in rows for item in json.loads(row[0] or "{}").get("results", [])):
+        break
+    time.sleep(0.01)
+else:
+    raise AssertionError("fast child result was not persisted before crash")
+conn.close()
+print("PERSISTED_CHILD_READY", flush=True)
+os._exit(1)
 '''
-    subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+    first = subprocess.run([sys.executable, "-c", producer], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+    assert first.returncode == 1 and "PERSISTED_CHILD_READY" in first.stdout, first.stderr
     consumer = r'''
-import json, queue
+import json, queue, sys
 from tools import async_delegation as ad
+# Startup/schema work is real, but is not the recovery operation being timed.
+ad._connect().close()
+print("RECOVERY_READY", flush=True)
+assert sys.stdin.readline().strip() == "recover"
 q = queue.Queue(); ad.restore_undelivered_completions(q)
 print(json.dumps(q.get_nowait(), sort_keys=True))
 '''
-    second = subprocess.run([sys.executable, "-c", consumer], cwd=repo, env=env, text=True, capture_output=True,
-                            timeout=15, check=True)
-    evt = json.loads(second.stdout.strip().splitlines()[-1])
+    import queue as readiness_queue
+    ready = readiness_queue.Queue()
+    with subprocess.Popen([sys.executable, "-c", consumer], cwd=repo, env=env, text=True,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as second:
+        def read_ready():
+            for line in second.stdout:
+                if line.strip() == "RECOVERY_READY":
+                    ready.put(True)
+                    return
+            ready.put(False)
+
+        reader = threading.Thread(target=read_ready, daemon=True)
+        reader.start()
+        try:
+            assert ready.get(timeout=30), "recovery consumer failed during startup"
+            reader.join(timeout=5)
+            # Keep the original 15s bound on actual recovery after readiness.
+            output, errors = second.communicate(input="recover\n", timeout=15)
+            assert second.returncode == 0, errors
+        finally:
+            if second.poll() is None:
+                second.kill()
+            reader.join(timeout=5)
+            second.communicate(timeout=5)
+    evt = json.loads(output.strip().splitlines()[-1])
     by_index = {r["task_index"]: r for r in evt["results"]}
     assert by_index[0]["status"] == "completed" and by_index[0]["summary"] == "done: fast member of the group task"
     assert by_index[1]["status"] == "unknown"
