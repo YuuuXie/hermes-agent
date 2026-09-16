@@ -182,12 +182,15 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
+    # #65824: only the sanitized event carries single-child timeout evidence.
+    durable_result = dict(result)
+    durable_result.pop("partial_output_tail", None)
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
                WHERE delegation_id=?""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]))
+             json.dumps(event), json.dumps(durable_result), event["delegation_id"]))
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -724,6 +727,55 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+    if not is_batch:
+        # A single background timeout is normalized through this event boundary
+        # before process_registry formats it. Treat the runner result as untrusted:
+        # validate the shape, force-redact complete strings before truncating, and
+        # fail closed on any malformed entry or redactor failure.
+        partial_tail = result.get("partial_output_tail")
+        if (
+            status == "timeout"
+            and result.get("partial") is True
+            and isinstance(partial_tail, list)
+            and partial_tail
+        ):
+            try:
+                from agent.redact import redact_sensitive_text
+
+                safe_partial_tail = []
+                for entry in partial_tail[-8:]:
+                    if (
+                        not isinstance(entry, dict)
+                        or not isinstance(entry.get("tool"), str)
+                        or not isinstance(entry.get("preview"), str)
+                        or not isinstance(entry.get("is_error"), bool)
+                    ):
+                        raise ValueError("invalid partial output tail entry")
+                    # ``tool`` is display-only here and comes from the untrusted
+                    # runner result. Do not echo it across the security boundary:
+                    # arbitrary identifier-looking text can still be a secret.
+                    safe_partial_tail.append(
+                        {
+                            "tool": "tool",
+                            "preview": redact_sensitive_text(
+                                entry["preview"], force=True
+                            )[:600],
+                            "is_error": entry["is_error"],
+                        }
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to sanitize async delegation timeout evidence; "
+                    "dropping output tail",
+                    exc_info=True,
+                )
+            else:
+                evt["partial"] = True
+                evt["partial_output_tail"] = safe_partial_tail
+    if not is_batch and status == "timeout":
+        for key in ("child_session_id", "files_written", "worktree", "worker_still_running", "worker_state"):
+            if key in result:
+                evt[key] = result[key]
     try:
         _persist_completion(evt, result)
     except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
