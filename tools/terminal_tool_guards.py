@@ -101,8 +101,10 @@ _LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
 # (``npm install nodemon``, ``pip install uvicorn``): nothing is launched, so
 # it must not trip the long-lived-server guidance.
 _PACKAGE_MANAGER_INSTALL_RE = re.compile(
-    r"\b(?:pip3?|python3?\s+-m\s+pip|conda|apt(?:-get)?|apk|brew|npm|pnpm|yarn|bun)\s+"
-    r"(?:\S+\s+)*(?:install|add)\b",
+    r"\b(?:(?:pip3?|python3?\s+-m\s+pip)\s+"
+    r"(?:\S+\s+)*(?:install|uninstall|download|wheel|hash|check)|"
+    r"(?:conda|apt(?:-get)?|apk|brew|npm|pnpm|yarn|bun)\s+"
+    r"(?:\S+\s+)*(?:install|add))\b",
     re.IGNORECASE,
 )
 # Split on top-level shell separators only — the input is already quote-blanked

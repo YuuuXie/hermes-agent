@@ -85,6 +85,17 @@ class TestBackgroundGuidanceRecipes:
 
 
 class TestPackageManagerInstallExemption:
+    def test_pip_package_operations_are_not_server_launches(self):
+        for verb in ("uninstall", "download", "wheel", "hash", "check"):
+            for prefix in ("pip", "pip3", "python3 -m pip"):
+                command = f"{prefix} {verb} uvicorn"
+                assert _foreground_background_guidance(command) is None, command
+
+    def test_pip_operations_do_not_exempt_a_later_server(self):
+        for verb in ("uninstall", "download", "wheel", "hash", "check"):
+            command = f"pip {verb} uvicorn && uvicorn app:app"
+            assert _foreground_background_guidance(command) is not None, command
+
     def test_package_manager_installs_not_flagged(self):
         # Installing a dependency merely names the same binary — nothing is
         # launched, so the long-lived-server guidance must stay silent.
