@@ -217,10 +217,40 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
             lines += ["Partial output:", r_summary]
         else:
             lines.append(f"(no summary — status={r_status}" + (f": {r_error}" if r_error else "") + ")")
+        lines += _render_partial_output_tail(r.get("partial_output_tail")) + _artifact_reference_lines(r)
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
         lines += _process_accounting_lines(r)
     return "\n".join(lines)
+
+
+def _render_partial_output_tail(tail) -> list:
+    """Render a bounded ``partial_output_tail`` (``{tool, preview, is_error}`` entries, already redacted at
+    extraction time) into re-injection lines. Explicitly labelled partial + redacted so the reading agent never
+    mistakes a timed-out child's evidence for a completed result."""
+    if not isinstance(tail, list):
+        return []
+    lines = ["Partial output (redacted) from the timed-out child — evidence only, NOT a completed result:"]
+    for entry in tail:
+        if not isinstance(entry, dict):
+            continue
+        lines.append(f"  [{entry.get('tool', 'tool')}] {entry.get('preview', '')}")
+    return lines if len(lines) > 1 else []
+
+
+def _artifact_reference_lines(r: dict) -> list:
+    """Durable pointers to a timed-out child's work: its session transcript and the files it wrote. These stand on
+    their own when a near-deadline handoff instruction never landed."""
+    lines = []
+    sid = r.get("child_session_id")
+    if sid:
+        lines.append(f"Child session (full transcript): {sid}")
+    written = r.get("files_written") or []
+    if written:
+        lines.append("Files the child wrote (durable, survive its timeout): "
+                     + ", ".join(str(p) for p in written[:8])
+                     + (f" (+{len(written) - 8} more)" if len(written) > 8 else ""))
+    return lines
 
 
 def _process_accounting_lines(r: dict) -> list:
@@ -277,6 +307,7 @@ def _format_async_delegation(evt: dict) -> str:
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))
         if summary:
             lines += ["Partial output:", summary]
+    lines += _render_partial_output_tail(evt.get("partial_output_tail")) + _artifact_reference_lines(evt)
     return "\n".join(lines)
 
 

@@ -699,16 +699,62 @@ class _ChildRun:
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
 
     def finish_failed(
-        self, entry: Dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "", status: Optional[str] = None,
+        self, entry: Dict[str, Any], late_steer: Optional[str], *, preview: str, summary: str = "",
+        status: Optional[str] = None, output_tail: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Shared tail of every failure path: emit ``subagent.complete`` (``status`` defaults to the entry's), note
-        the steer text that won the race with the failure, report the worktree."""
-        _safe_progress(
-            self.child_progress_cb, "subagent.complete", preview=preview, status=status or entry["status"],
-            duration_seconds=entry["duration_seconds"], summary=summary,
-        )
+        the steer text that won the race with the failure, report the worktree.
+
+        ``output_tail`` carries the already-redacted partial evidence of a timed-out child so surfaces watching the
+        progress relay see the same tail the result entry carries. ``summary`` stays empty: a failed child has NOT
+        produced a summary and must never be rendered as if it completed."""
+        complete_kwargs: Dict[str, Any] = {
+            "preview": preview, "status": status or entry["status"],
+            "duration_seconds": entry["duration_seconds"], "summary": summary,
+        }
+        if output_tail:
+            complete_kwargs["output_tail"] = output_tail
+        _safe_progress(self.child_progress_cb, "subagent.complete", **complete_kwargs)
         _append_missed_steer(entry, late_steer)
         return self.attach_worktree(entry)
+
+    def collect_partial_output_tail(self) -> List[Dict[str, Any]]:
+        """Bounded, redacted tail of the timed-out child's COMPLETED tool results (8 × 600 chars).
+
+        The Future never returned, so the child's transcript is read from its live ``_session_messages`` list.  Only
+        ``role == "tool"`` messages are read by ``_extract_output_tail``, so raw assistant reasoning / private
+        chain-of-thought is never surfaced.  ``fail_closed=True``: evidence from a FAILED child is a security
+        boundary, so an unverifiable redaction drops the whole tail rather than risk an unredacted preview.  Any
+        failure here degrades to the legacy timeout schema and never raises."""
+        try:
+            session_messages = getattr(self.child, "_session_messages", None)
+            if not isinstance(session_messages, list):
+                return []
+            return [
+                item
+                for item in _extract_output_tail(
+                    {"messages": list(session_messages)}, max_entries=8, max_chars=600, fail_closed=True,
+                )
+                if isinstance(item, dict) and isinstance(item.get("preview"), str) and item["preview"].strip()
+            ]
+        except Exception:
+            # Handling an existing timeout: never turn observability damage into a new error or an unredacted leak.
+            logger.warning("Failed to extract redacted delegated timeout output; dropping output tail", exc_info=True)
+            return []
+
+    def attach_artifact_refs(self, entry: Dict[str, Any]) -> None:
+        """Point the parent at the timed-out child's DURABLE work: its session id (transcript), and the files it
+        wrote. The worktree/branch is attached separately by ``attach_worktree``. These references are the fallback
+        path for a handoff instruction that never landed, so they must work on their own."""
+        with _quiet("timeout artifact refs failed", exc_info=True):
+            session_id = getattr(self.child, "session_id", None)
+            if isinstance(session_id, str) and session_id:
+                entry["child_session_id"] = session_id
+        with _quiet("timeout file-write refs failed", exc_info=True):
+            writes = file_state.writes_since("", self.wall_start, []) or {}
+            written = sorted({p for tid, paths in writes.items() if tid == self.child_task_id for p in paths})[:40]
+            if written:
+                entry["files_written"] = written
 
     def close_steering(self) -> Optional[str]:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
@@ -845,7 +891,20 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
-        self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
+        # A timed-out child may already have completed useful tool calls. Attach that bounded, redacted evidence plus
+        # pointers to its durable artifacts. Ordinary exceptions keep the existing error schema untouched.
+        partial_output_tail: List[Dict[str, Any]] = []
+        if is_timeout:
+            partial_output_tail = self.collect_partial_output_tail()
+            if partial_output_tail:
+                _error_entry["partial"] = True
+                _error_entry["partial_output_tail"] = partial_output_tail
+            self.attach_artifact_refs(_error_entry)
+        self.finish_failed(
+            _error_entry, _late_pending_steer,
+            preview=f"Timed out after {duration}s" if is_timeout else str(exc),
+            output_tail=partial_output_tail or None,
+        )
         close_deferred = is_timeout and not future.done()
         if close_deferred:
             self.abandoned_future = future
