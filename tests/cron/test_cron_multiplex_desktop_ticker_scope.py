@@ -95,9 +95,13 @@ def test_multiplex_ticker_profile_gate_skips_rejected_profile(tmp_path):
             daemon=True,
         )
         thread.start()
-        thread.join(timeout=5)
-        stop.set()
-        thread.join(timeout=5)
+        try:
+            # The tick callback owns completion after three cycles. Do not
+            # stop a cold provider before its profile/schema startup finishes.
+            assert stop.wait(timeout=30), "provider did not complete three gated cycles"
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
     assert not thread.is_alive()
     assert set(ticked) == {str(orphan)}
