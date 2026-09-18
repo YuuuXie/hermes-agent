@@ -49,6 +49,10 @@ def _runner(adapter, *, origins=None):
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
         _entries=origins or {},
+        # Route-ownership pre-flight: no session bound to the key in this double, which is the
+        # "not proven lost" branch (deliver). Present so the lookup does not raise, since a
+        # RAISING lookup is now an honest retry rather than a silent deliver.
+        lookup_by_session_key=lambda key: (origins or {}).get(key),
     )
     runner._session_source_cache = {}
     runner._completion_delivery_lock = __import__("threading").Lock()

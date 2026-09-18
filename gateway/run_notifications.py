@@ -52,6 +52,30 @@ _DURABLE_CLAIM_OPS = {
 }
 
 
+def _handed_off_route_overrides(session) -> dict:
+    """Event fields the authoritative ProcessSession owns after an EXPLICIT handoff.
+
+    A watcher descriptor snapshots the spawning conversation's ids when the process starts.
+    ``process_manage(action='handoff')`` later transfers the process to a different, validated
+    conversation, but that descriptor is already armed on the gateway loop and is never rewritten —
+    so without this the completion of a handed-off process keeps pointing at the child, the route
+    guard refuses to re-point a routing key for an internal completion, and the result is dropped.
+
+    Only ``ownership_handed_off`` sessions override anything: a plain child process (no handoff)
+    still delivers on its snapshot, which is what keeps an internal completion from prospectively
+    taking over a human route. Empty values never override — the handoff may not have proven a
+    routing key, and blanking one would strand the event with no source at all.
+    """
+    if not getattr(session, "ownership_handed_off", False):
+        return {}
+    overrides = {}
+    for field in ("parent_session_id", "session_key"):
+        value = str(getattr(session, field, "") or "").strip()
+        if value:
+            overrides[field] = value
+    return overrides
+
+
 def _raw_process_event_session_id(evt: dict) -> str:
     """Recognize API routes, not malformed structured or partial messaging routes."""
     session_key = str(evt.get("session_key") or "").strip()
@@ -61,6 +85,22 @@ def _raw_process_event_session_id(evt: dict) -> str:
     if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
         return ""
     return str(evt.get("origin_session_id") or session_key or "").strip()
+
+
+def _is_raw_api_route(evt: Optional[dict]) -> bool:
+    """True for a raw API/CLI event: a route that legitimately has no structured gateway key.
+
+    Such an event can never gain one, so its unknown route ownership must not become a retry
+    loop. Recognized exactly as the dispatcher recognizes it, except that an api_server event
+    is still raw when its session id has not been stamped onto the event yet.
+    """
+    if not evt:
+        return False
+    if _raw_process_event_session_id(evt):
+        return True
+    session_key = str(evt.get("session_key") or "").strip()
+    platform = str(evt.get("platform") or "").strip().lower()
+    return platform == "api_server" and not session_key.startswith("agent:")
 
 
 class GatewayNotificationsMixin:
@@ -1218,7 +1258,7 @@ class GatewayNotificationsMixin:
             return seen
 
     async def _classify_completion_target(
-        self, parent_session_id: str, session_key: str = "",
+        self, parent_session_id: str, session_key: str = "", *, evt: Optional[dict] = None,
     ) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
@@ -1228,8 +1268,9 @@ class GatewayNotificationsMixin:
         ``session_key`` (when known) also checks ROUTE ownership, because the resolver refuses to
         re-point a routing key for an internal completion: a live pin that no longer owns its route
         is undeliverable, and saying "deliver" here would ack the durable row after adapter
-        acceptance for an injection the pipeline then discards. An unknown route is left to the
-        resolver (unchanged verdict) rather than turned into a spin loop."""
+        acceptance for an injection the pipeline then discards. Ownership that cannot be established
+        is ``"route_retry"`` (retry, spending a delivery attempt so it cannot spin forever) rather
+        than ``deliver`` — except for raw API/CLI routes, which never have a structured key."""
         from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
@@ -1242,7 +1283,7 @@ class GatewayNotificationsMixin:
         if parent is None:
             return "terminal"
         if not parent.get("ended_at"):
-            return await self._classify_live_pin_route_ownership(parent_session_id, session_key)
+            return await self._classify_live_pin_route_ownership(parent_session_id, session_key, evt=evt)
         end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
@@ -1262,16 +1303,31 @@ class GatewayNotificationsMixin:
         return "deliver"
 
     async def _classify_live_pin_route_ownership(
-        self, parent_session_id: str, session_key: str,
+        self, parent_session_id: str, session_key: str, *, evt: Optional[dict] = None,
     ) -> str:
-        """``deliver``/``terminal`` for a LIVE pin, based on whether it still owns ``session_key``.
+        """``deliver``/``terminal``/``retry`` for a LIVE pin, based on whether it still owns
+        ``session_key``.
 
-        Returns ``deliver`` whenever ownership cannot be established (no key, no store, lookup
-        failure): the resolver remains the authority and this stays a pre-flight honesty check,
-        not a second gate that can strand a deliverable result.
+        The resolver refuses to re-point a routing key for an internal completion, so "this pin
+        owns its route" is the actual delivery precondition. When ownership cannot be established
+        the honest answer is ``route_retry`` (release the claim, try again) — saying ``deliver``
+        would acknowledge the durable row for an injection the resolver then discards. It is a
+        distinct verdict from a plain ``retry`` because it SPENDS a delivery attempt: unlike a DB
+        outage, an unresolvable route may never resolve, and the ledger's attempt budget is what
+        stops it from being replayed forever.
+
+        Two unknowns are not retried at all, because no later attempt can resolve them: raw
+        API/CLI routes legitimately carry no structured routing key, and a missing session store
+        is a permanent misconfiguration of this runner. Both keep the pre-existing ``deliver``.
         """
         if not session_key:
-            return "deliver"
+            if _is_raw_api_route(evt):
+                return "deliver"
+            logger.debug(
+                "Async-completion pre-flight cannot verify route ownership for live pin %s: "
+                "no routing key on the event; retrying rather than acknowledging it.",
+                parent_session_id)
+            return "route_retry"
         store = getattr(self, "async_session_store", None)
         if store is None:
             return "deliver"
@@ -1279,8 +1335,15 @@ class GatewayNotificationsMixin:
             entry = await store.lookup_by_session_key(session_key)
         except Exception:
             logger.debug("Async-completion pre-flight route lookup failed for %s", session_key, exc_info=True)
+            return "route_retry"
+        if entry is None:
+            # No session bound to this key yet (first delivery on a fresh route, store not
+            # loaded): the resolver creates/looks one up and remains the authority. NOT a proven
+            # loss of ownership, and not treated as one -- see the residue note in the rework
+            # report: this branch can still classify ``deliver`` for a result the resolver later
+            # refuses. Narrowing it requires knowing the route is genuinely bound elsewhere.
             return "deliver"
-        if entry is None or entry.session_id == parent_session_id:
+        if entry.session_id == parent_session_id:
             return "deliver"
         logger.warning(
             "Completion pinned to live session %s no longer owns routing key %s (current=%s); "
@@ -1307,10 +1370,13 @@ class GatewayNotificationsMixin:
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
             verdict = await self._classify_completion_target(
-                parent_session_id, str(evt.get("session_key") or "").strip())
+                parent_session_id, str(evt.get("session_key") or "").strip(), evt=evt)
             if verdict != "deliver":
-                # Definitively closed targets still need the normal terminal disposition.
-                return verdict == "terminal"
+                # ``terminal`` and ``route_retry`` are settled by the claim path below, which gives
+                # them an honest durable disposition (a route retry must spend an attempt, or an
+                # unresolvable route would be replayed forever). A plain ``retry`` is DB/transport
+                # unavailability: bail out before claiming so the budget survives a restart.
+                return verdict != "retry"
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -1371,7 +1437,7 @@ class GatewayNotificationsMixin:
         # acknowledge the durable row as delivered. Verify the target here, before acceptance, and give
         # drops an honest durable disposition.
         verdict = await self._classify_completion_target(
-            parent_session_id, str(evt.get("session_key") or "").strip())
+            parent_session_id, str(evt.get("session_key") or "").strip(), evt=evt)
         if verdict == "terminal":
             if evt_type == "async_delegation":
                 logger.warning(
@@ -1389,8 +1455,10 @@ class GatewayNotificationsMixin:
                     evt.get("session_id") or "<unknown>", parent_session_id,
                 )
             claim.proceed = False
-        elif verdict == "retry":
+        elif verdict in {"retry", "route_retry"}:
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
+            # ``route_retry`` releases the claim it just spent, so the ledger's attempt budget
+            # eventually converges an unresolvable route to ``dropped`` instead of replaying it.
             if claim.claim_id:
                 self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
             claim.proceed, claim.early_result = False, False
@@ -1818,6 +1886,9 @@ class GatewayNotificationsMixin:
             "parent_session_id": (
                 watcher.get("parent_session_id") or getattr(session, "parent_session_id", "") or ""
             ),
+            # An explicit, validated handoff re-stamped the owner AFTER the descriptor was armed:
+            # the session, not the snapshot, is authoritative. Must stay last.
+            **_handed_off_route_overrides(session),
         }
 
     def _format_process_final_message(self, session_id: str, session, notify_mode: str) -> str:
