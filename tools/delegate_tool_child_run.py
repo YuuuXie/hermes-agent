@@ -875,7 +875,11 @@ class _ChildRun:
                     return future.result(), None, False
                 now = time.monotonic()
                 if release_stale_wait and settled.is_set():
-                    # Only the stale verdict can have set it while the Future is still pending.
+                    # ``settled`` has TWO setters (the stale verdict and the worker's done-callback),
+                    # so re-read the Future first: it may have completed since the check above, and a
+                    # finished child's result must never be discarded as a timeout.
+                    if future.done():
+                        return future.result(), None, False
                     stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
                     raise FuturesTimeoutError()
                 if timeout_deadline is not None and now >= timeout_deadline:
