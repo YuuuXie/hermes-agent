@@ -245,8 +245,12 @@ class _Heartbeat:
         # activity_ts) all froze; thresholds differ idle vs in-tool.
         self.last_seen = {"iter": 0, "tool": None, "ts": None, "stale": 0}
         self.handle = None
-        self.stale = threading.Event()
-        self.stale_after_seconds: Optional[float] = None
+        # Set on the stale verdict; ``await_child`` waits on it (its worker's done-callback
+        # sets it too) so a wedged child ends the wait instead of only ending the heartbeat.
+        self.settled = threading.Event()
+        # Threshold (seconds of frozen activity) the stale verdict fired at; None until it does.
+        # ``await_child`` reads it to name the real cause when a configured cap was still pending.
+        self.stale_threshold_seconds: Optional[float] = None
 
     def start(self) -> None:
         from agent.periodic_scheduler import schedule
@@ -260,7 +264,7 @@ class _Heartbeat:
 
     def tick(self):
         """Returning False stops the periodic callback."""
-        from tools.delegate_tool import _HEARTBEAT_STALE_CYCLES_IDLE, _HEARTBEAT_STALE_CYCLES_IN_TOOL
+        from tools.delegate_tool import _HEARTBEAT_INTERVAL, _HEARTBEAT_STALE_CYCLES_IDLE, _HEARTBEAT_STALE_CYCLES_IN_TOOL
         child, parent_agent, task_index, last_seen = self.child, self.parent_agent, self.task_index, self.last_seen
         touch = getattr(parent_agent, "_touch_activity", None) if parent_agent is not None else None
         if not touch:
@@ -283,15 +287,15 @@ class _Heartbeat:
                     last_seen["ts"] = child_activity_ts
             else:
                 last_seen["stale"] += 1
-            if last_seen["stale"] >= (_HEARTBEAT_STALE_CYCLES_IN_TOOL if child_tool else _HEARTBEAT_STALE_CYCLES_IDLE):
-                stale_cycles = last_seen["stale"]
-                from tools.delegate_tool import _HEARTBEAT_INTERVAL
-                self.stale_after_seconds = stale_cycles * _HEARTBEAT_INTERVAL
-                self.stale.set()
+            stale_cycles = _HEARTBEAT_STALE_CYCLES_IN_TOOL if child_tool else _HEARTBEAT_STALE_CYCLES_IDLE
+            if last_seen["stale"] >= stale_cycles:
                 logger.warning(
-                    "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — abandoning pending run",
-                    task_index, stale_cycles, child_tool or "<none>",
+                    "Subagent %d appears stale (no progress for %d heartbeat cycles, tool=%s) — abandoning its wait",
+                    task_index, last_seen["stale"], child_tool or "<none>",
                 )
+                # A finite/-Q turn has no gateway watchdog behind this; the wait itself must end (#109749).
+                self.stale_threshold_seconds = stale_cycles * _HEARTBEAT_INTERVAL
+                self.settled.set()
                 return False
             if child_tool:
                 desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
@@ -650,6 +654,7 @@ class _ChildRun:
     goal: str
     subagent_id: Optional[str]
     child_progress_cb: Any
+    heartbeat: Any = None
     child_start: float = field(default_factory=time.monotonic)
     worktree_info: Optional[Dict[str, str]] = None
     child_task_id: str = ""
@@ -846,36 +851,52 @@ class _ChildRun:
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        # One event covers both ways out: the worker finishing, or the heartbeat's stale verdict.
+        # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
+        # one-shot) turn — and its session lease — forever, since that runtime has no gateway
+        # inactivity watchdog (#109749).
+        settled = self.heartbeat.settled if self.heartbeat is not None else threading.Event()
+        future.add_done_callback(lambda _f: settled.set())
+        # Set when the stale verdict — not the configured cap — ended the wait; the entry must name that cause.
+        stale_after: Optional[float] = None
         timeout_deadline = time.monotonic() + child_timeout if child_timeout is not None else None
-        # Near-deadline handoff cutoff, measured BACKWARDS from the existing hard deadline: this never extends the
-        # wait. Clamped to half the timeout so a grace >= the timeout cannot fire before the child has done anything.
+        # Near-deadline handoff cutoff (ours), measured BACKWARDS from the existing hard deadline: this never
+        # extends the wait. Clamped to half the timeout so a grace >= the timeout cannot fire before the child
+        # has done anything.
         handoff_deadline: Optional[float] = None
         if timeout_deadline is not None and child_timeout is not None:
             grace = _get_handoff_grace_seconds()
             if grace is not None and grace > 0:
                 handoff_deadline = timeout_deadline - min(float(grace), child_timeout / 2.0)
         handoff_sent = False
-        stale_watchdog = False
         try:
             while True:
                 if future.done():
                     return future.result(), None, False
-                if release_stale_wait and heartbeat.stale.is_set():
-                    stale_watchdog = True
+                now = time.monotonic()
+                if release_stale_wait and settled.is_set():
+                    # Only the stale verdict can have set it while the Future is still pending.
+                    stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
                     raise FuturesTimeoutError()
-                if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                if timeout_deadline is not None and now >= timeout_deadline:
                     raise FuturesTimeoutError()
-                if handoff_deadline is not None and not handoff_sent and time.monotonic() >= handoff_deadline:
+                if handoff_deadline is not None and not handoff_sent and now >= handoff_deadline:
                     handoff_sent = True  # exactly once, whether or not the steer lands
                     self.send_handoff_steer()
-                wait_seconds = 0.5
+                    continue
+                # Block until the next event of interest instead of polling: the settled event, the hard
+                # deadline, or the handoff cutoff — whichever is nearest.
+                wait_seconds: Optional[float] = None
                 if timeout_deadline is not None:
-                    remaining = timeout_deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise FuturesTimeoutError()
-                    wait_seconds = min(wait_seconds, remaining)
+                    wait_seconds = timeout_deadline - now
                 if handoff_deadline is not None and not handoff_sent:
-                    wait_seconds = min(wait_seconds, max(0.0, handoff_deadline - time.monotonic()))
+                    _to_handoff = handoff_deadline - now
+                    wait_seconds = _to_handoff if wait_seconds is None else min(wait_seconds, _to_handoff)
+                if release_stale_wait:
+                    settled.wait(timeout=wait_seconds)
+                    continue
+                # Detached unit (release_stale_wait=False): a stale verdict must NOT end the wait, so
+                # ``settled`` is unusable as the wake-up — only the Future or the configured cap may end it.
                 try:
                     return future.result(timeout=wait_seconds), None, False
                 except FuturesTimeoutError:
@@ -892,7 +913,10 @@ class _ChildRun:
 
         _late_pending_steer = self.close_steering()
         _signal_child_stop(child)
-        is_timeout = stale_watchdog or isinstance(exc, (FuturesTimeoutError, TimeoutError))
+        is_timeout = isinstance(exc, (FuturesTimeoutError, TimeoutError))
+        # What actually ended the wait: the stale threshold pre-empts a longer configured cap.
+        timeout_cause = stale_after if stale_after is not None else child_timeout
+        stale_watchdog = stale_after is not None
         duration = self.elapsed()
         logger.warning("Subagent %d %s after %.1fs", task_index, "timed out" if is_timeout else f"raised {type(exc).__name__}", duration)
         child_api_calls = 0
@@ -902,11 +926,10 @@ class _ChildRun:
         before_first_call = is_timeout and child_api_calls == 0
         diagnostic_path: Optional[str] = None
         if before_first_call:
-            effective_timeout = heartbeat.stale_after_seconds if stale_watchdog else child_timeout
-            assert effective_timeout is not None
             diagnostic_path = _dump_subagent_timeout_diagnostic(
                 child=child, task_index=task_index,
-                timeout_seconds=float(effective_timeout), duration_seconds=float(duration),
+                # A stale verdict or a configured cap; ``or 0.0`` guards the type checker.
+                timeout_seconds=float(timeout_cause or 0.0), duration_seconds=float(duration),
                 worker_thread=worker_thread_holder.get("t"), goal=self.goal,
             )
             if diagnostic_path:
@@ -914,8 +937,9 @@ class _ChildRun:
         if not is_timeout:
             _err = str(exc)
         elif before_first_call:
+            # Ours: a zero-API stall keeps its own pre-request phrasing, and the stale verdict (when it is what
+            # ended the wait) names the threshold rather than a cap the child never reached.
             if stale_watchdog:
-                stale_after = heartbeat.stale_after_seconds
                 _err = (
                     "Subagent stopped making progress"
                     + (f" for {stale_after:g}s" if stale_after is not None else "")
@@ -927,11 +951,10 @@ class _ChildRun:
                     f"its first LLM request (prompt construction, credential resolution, or transport may be stuck)."
                 )
         elif stale_watchdog:
-            stale_after = heartbeat.stale_after_seconds
             _err = (
-                "Subagent stopped making progress"
-                + (f" for {stale_after:g}s" if stale_after is not None else "")
-                + f" after {child_api_calls} API call(s); the pending worker was abandoned."
+                f"Subagent stopped making progress after {child_api_calls} API call(s) — no activity for "
+                + (f"{stale_after:g}s (heartbeat stale threshold)" if stale_after is not None else "the stale threshold")
+                + "; the pending worker was abandoned."
             )
         else:
             _err = (
@@ -944,7 +967,7 @@ class _ChildRun:
         _error_entry = {
             "task_index": task_index, "status": status, "summary": None, "error": _err, "exit_reason": status,
             "api_calls": child_api_calls, "duration_seconds": duration,
-            "timeout_seconds": child_timeout if is_timeout and not stale_watchdog else None,
+            "timeout_seconds": timeout_cause if is_timeout else None,
             "timed_out_after_seconds": duration if is_timeout else None,
             "timeout_phase": (
                 "before_first_llm_call" if before_first_call else

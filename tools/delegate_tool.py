@@ -313,8 +313,9 @@ def _run_single_child(
     """
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
-    # Heartbeat keeps the parent's _last_activity_ts moving while the child works. Its stale signal also releases
-    # await_child(): finite/synchronous sessions have no gateway watchdog to rescue a wedged completed child.
+    # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while the
+    # child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait —
+    # finite/synchronous sessions have no gateway watchdog to rescue a wedged completed child.
     heartbeat = _start_heartbeat(child, parent_agent, task_index)
     # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
     # doubles without a stable id. Unregistered in the finally block.
@@ -322,7 +323,7 @@ def _run_single_child(
         child, parent_agent, goal, owner_session_id=owner_session_id, owner_transport=owner_transport,
         owner_session_record=owner_session_record,
     )
-    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb)
+    run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
