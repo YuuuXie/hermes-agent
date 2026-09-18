@@ -465,6 +465,9 @@ class ProcessSession:
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
+    ownership_handed_off: bool = False          # an EXPLICIT, validated transfer re-stamped the delivery owner
+                                                # below; only then may this session out-vote a watcher descriptor
+                                                # that was armed before the transfer
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -518,7 +521,7 @@ _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
-    "parent_session_id", "notify_on_complete", "watch_patterns")
+    "parent_session_id", "ownership_handed_off", "notify_on_complete", "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1414,6 +1417,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id or session.task_id,
                 "command": session.command,
+                # The conversation this result is pinned to. Consumers fail closed on an
+                # unknown pin, so omitting it here made the queue path unable to express an
+                # explicit handoff's new owner at all.
+                **({"parent_session_id": session.parent_session_id}
+                   if session.parent_session_id else {}),
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
                 **self._exit_fields(session),
                 "output": _output_tail(session, 2000),
@@ -2134,19 +2142,34 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
+                           to_session_key: str, note: str = "",
+                           to_parent_session_id: str = "") -> Optional[ProcessSession]:
         """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
         field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
         whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
-        (the caller must not report a transfer that did not happen)."""
+        (the caller must not report a transfer that did not happen).
+
+        ``to_parent_session_id`` re-stamps the DELIVERY owner (the conversation the completion is
+        pinned to). Without it the process kept the child's session id, and since an internal
+        completion may not take a routing key away from its current session, the handed-off result
+        had nowhere to land. Transferring a process is the one place where the new supervising
+        conversation is explicitly authorized; ``ownership_handed_off`` records that authorization so
+        the completion builder may prefer this session over a watcher descriptor that was armed
+        before the transfer. An empty ``to_session_key`` leaves the existing ROUTING key alone: the
+        caller could not prove a new one, and a raw session id there is not a route.
+        """
         session = self.get(session_id)
         with self._lock:
             if session is None or session.exited or session.owner_task_id != from_owner:
                 return None
             session.owner_task_id = to_owner
             session.task_id = to_task_id
-            session.session_key = to_session_key
+            if to_session_key:
+                session.session_key = to_session_key
             session.handoff_note = note
+            if to_parent_session_id:
+                session.parent_session_id = to_parent_session_id
+                session.ownership_handed_off = True
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:
@@ -2350,10 +2373,16 @@ def _handoff_process(session_id: str, args: dict, task_id: Optional[str]) -> dic
     note = str(args.get("data") or "").strip()
     if not note:
         return {"error": "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
+    # The parent's ROUTING key, never its session id: ``session_key`` is what
+    # ``has_active_for_session`` and the completion event's routing are keyed by, and a raw
+    # session id parses to no platform/chat at all. A parent that has no gateway key (CLI,
+    # one-shot runner) proves no new route, so the process keeps the key it was spawned with.
+    parent_session_key = str(getattr(parent, "_gateway_session_key", "") or "")
     session = process_registry.transfer_ownership(
         session_id, from_owner=str(task_id or ""), to_owner=parent_owner,
         to_task_id=_resolve_container_task_id(parent_owner),
-        to_session_key=str(getattr(parent, "session_id", "") or ""), note=note)
+        to_session_key=parent_session_key,
+        to_parent_session_id=str(getattr(parent, "session_id", "") or ""), note=note)
     if session is None:
         return {"error": f"cannot hand off {session_id}: not a running process you own (already exited? read its result "
                          "with poll/log and report it instead)."}

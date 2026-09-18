@@ -2,7 +2,9 @@
 
 Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 
-1. Completions are pinned to the spawning session (contributor commit).
+1. Completions are pinned to the spawning session, and delivered only when that
+   session still owns the routing key (or via a verified compression
+   continuation). An internal completion never re-points a route.
 2. A dead/ended spawning session is never resurrected: the injection is
    dropped, fail-closed (never rerouted to the peer's current session).
 3. /new interrupts the old conversation's in-flight async delegations.
@@ -100,7 +102,17 @@ class TestGatewayPinningFailsClosed:
 
 
     @pytest.mark.asyncio
-    async def test_live_spawning_session_rebinds_from_different_route(self):
+    async def test_live_spawning_session_never_steals_a_different_route(self):
+        """An internal completion is not a ``/resume``.
+
+        This used to assert the opposite — that a live pin on a DIFFERENT route was
+        rebound with ``switch_session``, which ends the route's current session with
+        ``session_switch`` and blanks its heartbeat. A background process started
+        inside a delegated child carries the human room's key with the CHILD's
+        session id, so that rebind silently replaced human conversations with
+        workers. Ownership of the pinned row proves nothing about who owns the
+        routing key now: fail closed and leave the result in the delegation records.
+        """
         current = self._entry("sess_current")
         pinned = self._entry("sess_live")
         runner = self._make_runner(
@@ -112,10 +124,25 @@ class TestGatewayPinningFailsClosed:
             current, "sess_live"
         )
 
-        assert resolved is pinned
-        getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live"
+        assert resolved is None
+        self._assert_no_route_change(runner)
+
+    @pytest.mark.asyncio
+    async def test_live_pin_equal_to_the_current_route_is_delivered(self):
+        """Fail-closed must not mean undeliverable: a completion pinned to the
+        session that currently owns the route is still delivered, with no route
+        mutation."""
+        current = self._entry("sess_current")
+        runner = self._make_runner(
+            {"sess_current": {"id": "sess_current", "ended_at": None}}
         )
+
+        resolved = await runner._resolve_async_delegation_session(
+            current, "sess_current"
+        )
+
+        assert resolved is current
+        self._assert_no_route_change(runner)
 
     @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):

@@ -60,6 +60,10 @@ def _runner(adapter, *, session_db=...):
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
         _entries={},
+        # Route-ownership pre-flight: nothing bound to the key here, i.e. ownership is not
+        # proven LOST (deliver). Present so the lookup does not raise, since a raising lookup
+        # is now an honest retry rather than a silent deliver.
+        lookup_by_session_key=lambda key: None,
     )
     runner._session_source_cache = {}
     runner._completion_delivery_lock = __import__("threading").Lock()
