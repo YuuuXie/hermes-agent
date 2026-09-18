@@ -254,12 +254,27 @@ class GatewayNotificationsMixin:
         if target_session_id == session_entry.session_id:
             return session_entry
         prior_session_id = session_entry.session_id
-        if follows_compression:
-            switched = await self.async_session_store.advance_compression_session(
-                session_entry.session_key, prior_session_id, target_session_id,
+        if not follows_compression:
+            # An internal completion is NOT ``/resume``. Re-pointing the routing key here used to run
+            # ``switch_session``, which ends the route's current session with ``session_switch``,
+            # blanks its heartbeat and leaves its goal behind — so a background process started
+            # inside a delegated child (human room key + the CHILD's session id) silently replaced
+            # the human conversation with the worker, and the child's own later result was then
+            # refused at that manufactured user boundary. The only ownership this event proves is
+            # over ``pinned_session_id`` itself; it proves nothing about who owns the routing key
+            # now. Fail closed: deliver only to the already-current session or to a VERIFIED
+            # compression continuation (handled above), never by taking the route away from
+            # whoever holds it. The result stays in the process/delegation records.
+            logger.warning(
+                "Internal completion pinned to live session %s is not the current session %s for "
+                "routing key %s; refusing to re-point the route (an internal notification is not a "
+                "user /resume) and dropping the injection (fail-closed).",
+                target_session_id, prior_session_id, session_entry.session_key,
             )
-        else:
-            switched = await self.async_session_store.switch_session(session_entry.session_key, target_session_id)
+            return None
+        switched = await self.async_session_store.advance_compression_session(
+            session_entry.session_key, prior_session_id, target_session_id,
+        )
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
@@ -1202,11 +1217,19 @@ class GatewayNotificationsMixin:
                 self._completion_deliveries_inflight.add(identity)
             return seen
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(
+        self, parent_session_id: str, session_key: str = "",
+    ) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
-        rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim)."""
+        rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim).
+
+        ``session_key`` (when known) also checks ROUTE ownership, because the resolver refuses to
+        re-point a routing key for an internal completion: a live pin that no longer owns its route
+        is undeliverable, and saying "deliver" here would ack the durable row after adapter
+        acceptance for an injection the pipeline then discards. An unknown route is left to the
+        resolver (unchanged verdict) rather than turned into a spin loop."""
         from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
@@ -1219,7 +1242,7 @@ class GatewayNotificationsMixin:
         if parent is None:
             return "terminal"
         if not parent.get("ended_at"):
-            return "deliver"
+            return await self._classify_live_pin_route_ownership(parent_session_id, session_key)
         end_reason = str(parent.get("end_reason") or "")
         if end_reason != "compression":
             # Only a USER-closed session (/new, user_exit, session_switch) is unreachable; idle/timeout
@@ -1238,6 +1261,35 @@ class GatewayNotificationsMixin:
             return "retry"
         return "deliver"
 
+    async def _classify_live_pin_route_ownership(
+        self, parent_session_id: str, session_key: str,
+    ) -> str:
+        """``deliver``/``terminal`` for a LIVE pin, based on whether it still owns ``session_key``.
+
+        Returns ``deliver`` whenever ownership cannot be established (no key, no store, lookup
+        failure): the resolver remains the authority and this stays a pre-flight honesty check,
+        not a second gate that can strand a deliverable result.
+        """
+        if not session_key:
+            return "deliver"
+        store = getattr(self, "async_session_store", None)
+        if store is None:
+            return "deliver"
+        try:
+            entry = await store.lookup_by_session_key(session_key)
+        except Exception:
+            logger.debug("Async-completion pre-flight route lookup failed for %s", session_key, exc_info=True)
+            return "deliver"
+        if entry is None or entry.session_id == parent_session_id:
+            return "deliver"
+        logger.warning(
+            "Completion pinned to live session %s no longer owns routing key %s (current=%s); "
+            "classifying terminal so the durable row is not acknowledged for an injection the "
+            "resolver will refuse.",
+            parent_session_id, session_key, entry.session_id,
+        )
+        return "terminal"
+
     @staticmethod
     def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
         """Best-effort ``drop``/``release`` of a durable completion claim."""
@@ -1254,7 +1306,8 @@ class GatewayNotificationsMixin:
 
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
-            verdict = await self._classify_completion_target(parent_session_id)
+            verdict = await self._classify_completion_target(
+                parent_session_id, str(evt.get("session_key") or "").strip())
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
@@ -1317,7 +1370,8 @@ class GatewayNotificationsMixin:
         # can still fail closed inside the message pipeline AFTER the adapter accepted, which would falsely
         # acknowledge the durable row as delivered. Verify the target here, before acceptance, and give
         # drops an honest durable disposition.
-        verdict = await self._classify_completion_target(parent_session_id)
+        verdict = await self._classify_completion_target(
+            parent_session_id, str(evt.get("session_key") or "").strip())
         if verdict == "terminal":
             if evt_type == "async_delegation":
                 logger.warning(
