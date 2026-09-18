@@ -141,13 +141,18 @@ def test_completion_preflight_runs_in_target_profile_scope(mux):
     runner = mux.runner
     runner._session_db_pinned = run_module._SESSION_DB_UNPINNED
     runner._session_db_handles, runner._session_db_handles_lock = {}, threading.Lock()
-    runner.session_store, runner._session_sources = None, {}
+    # Use the real profile-aware store: preflight now verifies both the owner row and route.
+    # A None/incomplete store cannot model that lookup contract.
+    from gateway.session import SessionStore
+    runner.session_store = SessionStore(mux.home / "sessions", runner.config)
+    runner._session_sources = {}
     evt = {"type": "async_delegation", "session_key": "agent:team_b:telegram:dm:1", "parent_session_id": "sess-b"}
 
     async def _run():
-        unscoped = await runner._classify_completion_target("sess-b")
+        # Match production preflight: a live owner is classified with its event's route.
+        unscoped = await runner._classify_completion_target("sess-b", evt["session_key"], evt=evt)
         async with runner._completion_event_scope(evt):
-            scoped = await runner._classify_completion_target("sess-b")
+            scoped = await runner._classify_completion_target("sess-b", evt["session_key"], evt=evt)
         return unscoped, scoped
 
     assert asyncio.run(_run()) == ("terminal", "deliver")
