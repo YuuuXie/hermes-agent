@@ -157,7 +157,7 @@ class GatewayNotificationsMixin:
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
         from gateway.run import _is_slack_ignored_channel
-        adapter = self._adapter_for_source(source)
+        adapter = self._delivery_adapter_for(source)
         if not adapter:
             return
         config = getattr(self, "config", None)
@@ -255,6 +255,9 @@ class GatewayNotificationsMixin:
             )
             return None
         pinned_row = None
+        # Snapshot the run generation before the row lookup awaits: a /stop or /new landing while
+        # the lookup is pending must not let this completion re-point the route afterwards.
+        run_generation = self._current_session_run_generation(session_entry.session_key)
         try:
             pinned_row = await session_db.get_session(pinned_session_id)
         except Exception:
@@ -294,6 +297,15 @@ class GatewayNotificationsMixin:
         if target_session_id == session_entry.session_id:
             return session_entry
         prior_session_id = session_entry.session_id
+        # Upstream CAS pre-check (kept): a boundary that landed while the pinned row lookup was
+        # awaiting invalidates this completion outright, before any routing decision below.
+        if not self._is_session_run_current(session_entry.session_key, run_generation):
+            logger.warning(
+                "Async-delegation completion for routing key %s was invalidated while resolving pinned "
+                "session %s; leaving the route on %s and dropping injection.",
+                session_entry.session_key, pinned_session_id, prior_session_id,
+            )
+            return None
         if not follows_compression:
             # An internal completion is NOT ``/resume``. Re-pointing the routing key here used to run
             # ``switch_session``, which ends the route's current session with ``session_switch``,
@@ -305,6 +317,10 @@ class GatewayNotificationsMixin:
             # now. Fail closed: deliver only to the already-current session or to a VERIFIED
             # compression continuation (handled above), never by taking the route away from
             # whoever holds it. The result stays in the process/delegation records.
+            #
+            # This is deliberately STRICTER than upstream f88, which re-points the route with a CAS
+            # on ``prior_session_id``. A CAS only proves the route has not moved since; it does not
+            # prove the completion owns the route, which is the actual #57498/#113690 hazard.
             logger.warning(
                 "Internal completion pinned to live session %s is not the current session %s for "
                 "routing key %s; refusing to re-point the route (an internal notification is not a "
@@ -318,7 +334,8 @@ class GatewayNotificationsMixin:
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
-                "owning session %s; dropping injection.", session_entry.session_key, target_session_id,
+                "owning session %s (route moved or unknown); dropping injection.",
+                session_entry.session_key, target_session_id,
             )
             return None
         logger.info(
@@ -1009,7 +1026,7 @@ class GatewayNotificationsMixin:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return self._restored_source(entry)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)
@@ -1104,6 +1121,7 @@ class GatewayNotificationsMixin:
         self-post them as a new role=user prompt. Other watch events wake the session via self-post.
         """
         from gateway.wake import deliver_wake, persist_delegation_delivery
+        scope = contextlib.nullcontext()
         if evt.get("type") == "async_delegation":
             info = "Async delegation completion — persisting delivery row for api_server session %s (no wake turn)"
             fail = "Async delegation delivery persist failed for session %s: %s"
@@ -1112,15 +1130,50 @@ class GatewayNotificationsMixin:
             info = "Watch pattern notification — waking api_server session %s via self-post"
             fail = "Watch notification self-post wake failed for session %s: %s"
             from agent.notification_presentation import diagnostic_process_event
-            deliver = lambda: deliver_wake(adapter, text=synth_text, session_id=raw_sid,
+            try:
+                served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
+            except LookupError as e:
+                logger.warning(fail, raw_sid, e)
+                return False
+            if served:
+                # The wake runs in the OWNING profile's scope, in-process (see ``deliver_wake``):
+                # the raw event carries no profile, so a completion scope was never installed.
+                from gateway.run import _async_profile_runtime_scope
+                source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
+                scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
+            deliver = lambda: deliver_wake(adapter, text=synth_text, session_id=raw_sid, profile=served,
                 notification_category="diagnostic" if diagnostic_process_event(evt) else "result")  # noqa: E731
         try:
             logger.info(info, raw_sid)
-            await deliver()
+            async with scope:
+                await deliver()
             return True
         except Exception as e:
             logger.warning(fail, raw_sid, e)
             return False
+
+    def _served_api_server_wake_profile(self, evt: dict, raw_sid: str) -> Optional[str]:
+        """The served (non-primary) profile whose own session store holds *raw_sid*, else ``None``
+        (the default profile's HTTP self-post). Blocking: reads served ``state.db`` files.
+
+        A served profile's ``api_server`` turn binds the RAW session id as its session key, so its
+        completion event names no profile: the only ownership proof is the served profile's own
+        store, exactly the rung the Kanban notifier applies. An event whose source DOES name a
+        served profile (structured key / persisted origin) must be owned by that profile or it
+        raises ``LookupError`` — never a wake in the default profile's store.
+        """
+        if not getattr(self.config, "multiplex_profiles", False):
+            return None
+        from gateway.run import _multiplex_profile_homes
+        from gateway.wake import session_owned_by_profile
+        primary = getattr(self, "_primary_profile_name", None) or "default"
+        hinted = str(getattr(self._build_process_event_source(evt), "profile", None) or "").strip()
+        if hinted and hinted != primary:
+            if session_owned_by_profile(self.config, hinted, raw_sid):
+                return hinted
+            raise LookupError(f"session is not in served profile {hinted!r}'s own store")
+        return next((name for name, _home in _multiplex_profile_homes(self.config)
+                     if name != primary and session_owned_by_profile(self.config, name, raw_sid)), None)
 
     def _resolve_injection_adapter(self, platform_name: str, source=None):
         """Adapter for a synthetic-event platform: alias-aware transport resolver first (one
@@ -1174,6 +1227,10 @@ class GatewayNotificationsMixin:
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = self._resolve_injection_adapter(platform_name, source)
+        if not adapter and platform_name == Platform.API_SERVER.value and getattr(source, "profile", None):
+            # A route-only served profile owns no adapter map; the shared listener wakes exactly the
+            # session that profile's store owns (proven in ``_self_post_api_server``), fail-closed.
+            adapter = self.adapters.get(Platform.API_SERVER)
         if not adapter:
             return False
         if not adapter_supports_push(adapter):

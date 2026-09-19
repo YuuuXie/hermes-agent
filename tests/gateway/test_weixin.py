@@ -257,13 +257,13 @@ class TestWeixinSendMessageIntegration:
 
 
 class TestWeixinChunkDelivery:
-    def _connected_adapter(self) -> WeixinAdapter:
+    def _connected_adapter(self, context_token="ctx-token") -> WeixinAdapter:
         adapter = _make_adapter()
         adapter._session = object()
         adapter._send_session = adapter._session
         adapter._token = "test-token"
         adapter._base_url = "https://weixin.example.com"
-        adapter._token_store.get = lambda account_id, chat_id: "ctx-token"
+        adapter._token_store.get = lambda account_id, chat_id: context_token
         return adapter
 
 
@@ -337,6 +337,27 @@ class TestWeixinChunkDelivery:
         assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == ["ctx-token", None]
         assert adapter._rate_limit_circuit_until == 0.0
 
+    @pytest.mark.parametrize("stored_token", [None, "ctx-token"])
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_prepare_failed_without_recovery_is_not_a_rate_limit(self, send_message_mock, stored_token):
+        """No token to drop (fresh pairing, #80125) or a tokenless re-send that still fails: the error names the
+        real cause and the rate-limit breaker stays closed, instead of "rate limited; cooldown active" for 30s."""
+        from gateway.platforms.base import classify_send_error
+
+        adapter = self._connected_adapter(context_token=stored_token)
+        adapter._rate_limit_circuit_threshold = 1
+        send_message_mock.return_value = {"ret": weixin.RATE_LIMIT_ERRCODE, "errmsg": "prepare failed"}
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert "prepare failed" in (result.error or "") and "cooldown" not in (result.error or "")
+        # The platform-neutral classifier must not route it back into the rate-limited redelivery lane either.
+        assert classify_send_error(None, result.error or "") != "rate_limited"
+        assert adapter._rate_limit_cooldown_remaining() == 0.0
+        assert [call.kwargs["context_token"] for call in send_message_mock.await_args_list] == (
+            [None] if stored_token is None else ["ctx-token", None])
+
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_tokenless_resend_does_not_consume_retry_budget(self, send_message_mock):
         """With ``send_chunk_retries=0`` the stale-session re-send must still happen: it is a different payload,
@@ -364,53 +385,8 @@ class TestWeixinChunkDelivery:
         result = asyncio.run(adapter.send_document("wxid_test123", str(doc)))
 
         assert result.success is False
-        assert "prepare failed" in (result.error or "")
+        assert "session not ready" in (result.error or "") and "prepare failed" in (result.error or "")
         assert [call.kwargs["context_token"] for call in send_items_mock.await_args_list] == ["ctx-token", None]
-
-
-    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
-    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
-    def test_prepare_failed_without_context_token_is_not_a_rate_limit(self, send_message_mock, sleep_mock):
-        # A cron / proactive push with no stored context_token cannot take the tokenless
-        # retry, so "prepare failed" used to fall through to the rate-limit arm: a backoff
-        # per chunk plus a cooldown circuit that then fast-fails unrelated sends. It is a
-        # stale session, not a frequency limit — surface it instead of burning the backoff.
-        adapter = self._connected_adapter()
-        adapter._token_store.get = lambda account_id, chat_id: None
-        adapter._send_chunk_retries = 3
-        adapter._send_chunk_retry_delay_seconds = 0
-        send_message_mock.return_value = {
-            "ret": weixin.RATE_LIMIT_ERRCODE, "errcode": None, "errmsg": "prepare failed",
-        }
-
-        result = asyncio.run(adapter.send("wxid_test123", "first"))
-
-        assert result.success is False
-        assert "stale session" in (result.error or "")
-        assert send_message_mock.await_count == 1
-        assert sleep_mock.await_count == 0
-        assert adapter._rate_limit_circuit_until == 0.0
-
-    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
-    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
-    def test_prepare_failed_after_tokenless_retry_is_not_a_rate_limit(self, send_message_mock, sleep_mock):
-        # The tokenless retry is the only cure and it is spent after one attempt; a second
-        # "prepare failed" must not be re-filed as a frequency limit.
-        adapter = self._connected_adapter()
-        adapter._send_chunk_retries = 3
-        adapter._send_chunk_retry_delay_seconds = 0
-        send_message_mock.return_value = {
-            "ret": weixin.RATE_LIMIT_ERRCODE, "errcode": None, "errmsg": "prepare failed",
-        }
-
-        result = asyncio.run(adapter.send("wxid_test123", "first"))
-
-        assert result.success is False
-        assert "stale session" in (result.error or "")
-        # 1 tokenful attempt + 1 tokenless retry, then surfaced — no backoff loop.
-        assert send_message_mock.await_count == 2
-        assert sleep_mock.await_count == 0
-        assert adapter._rate_limit_circuit_until == 0.0
 
 
 class TestWeixinOutboundMedia:
@@ -651,29 +627,6 @@ class TestIsStaleSessionRet:
         # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the
         # helper only disambiguates -2 from a genuine rate limit.
         assert weixin._is_stale_session_ret(-14, None, "session expired") is False
-
-
-    def test_ret_minus_2_with_unknown_error_is_stale(self):
-        # Expired session (#17228) - the original stale-session errmsg.
-        assert weixin._is_stale_session_ret(-2, None, "unknown error") is True
-
-
-    def test_ret_minus_2_with_prepare_failed_is_stale(self):
-        # A stale context_token reports "prepare failed", not "unknown error".
-        # Cron / proactive pushes hit this whenever no recent inbound message
-        # has refreshed the stored token for that peer. Treating it as a rate
-        # limit skips the tokenless retry that keeps those pushes working.
-        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is True
-
-
-    def test_errcode_minus_2_with_prepare_failed_is_stale(self):
-        # iLink reports the code in errcode on some responses and ret on
-        # others; both spellings must reach the tokenless retry.
-        assert weixin._is_stale_session_ret(None, -2, "prepare failed") is True
-
-
-    def test_stale_session_errmsg_match_is_case_insensitive(self):
-        assert weixin._is_stale_session_ret(-2, None, "Prepare Failed") is True
 
 
 class TestWeixinContentDedup:

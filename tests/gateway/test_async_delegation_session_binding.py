@@ -244,3 +244,56 @@ class TestResetHandlerInterruptsDelegations:
         src = inspect.getsource(slash_commands.GatewaySlashCommandsMixin._handle_reset_command)
         assert "interrupt_for_session" in src
         assert "session_reset" in src
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["none", "revoke", "replace"])
+async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
+    """Upstream #113690 scenario, asserted against the RETAINED fail-closed contract.
+
+    Upstream f88 lets an undisturbed non-compression pin re-point the route under a CAS.
+    This candidate keeps the stricter local guard (#57498): an internal completion is not a
+    ``/resume``, so it NEVER takes the routing key from whoever holds it — with or without a
+    concurrent boundary. What is retained from upstream is the run-generation invalidation
+    check itself (a boundary landing across the await must also invalidate), which is exercised
+    here via ``_is_session_run_current``. In every arm the route must stay where it was.
+    Real store + real resolver; the DB lookup is event-gated.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="test-chat", chat_type="dm", user_id="test-user")
+    entry = store.get_or_create_session(source)
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store
+    runner._async_session_store = AsyncSessionStore(store)
+    generation = runner._begin_session_run_generation(entry.session_key)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def get_session(session_id):
+        entered.set()
+        await release.wait()
+        return {"id": session_id, "ended_at": None}
+
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(side_effect=get_session))
+    task = asyncio.create_task(runner._resolve_async_delegation_session(entry, "test-pinned"))
+    await asyncio.wait_for(entered.wait(), 3)
+    expected = entry.session_id
+    if boundary != "none":
+        runner._invalidate_session_run_generation(entry.session_key, reason="test boundary")
+        assert not runner._is_session_run_current(entry.session_key, generation)
+    if boundary == "replace":
+        store.switch_session(entry.session_key, "test-replacement")
+        expected = "test-replacement"
+    release.set()
+    result = await asyncio.wait_for(task, 3)
+
+    # Retained guard: the pinned session never becomes the route owner.
+    assert store.lookup_by_session_key(entry.session_key).session_id == expected
+    assert store.lookup_by_session_key(entry.session_key).session_id != "test-pinned"
+    assert result is None

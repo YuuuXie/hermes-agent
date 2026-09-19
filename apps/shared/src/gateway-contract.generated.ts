@@ -1401,8 +1401,10 @@ export interface CompletionItem {
   meta?: string
   kind?: string | null
 }
+/** ``session_id`` binds skill completions to that session's profile and workspace (project skills). */
 export interface CompleteSlashParams {
   text?: string | null
+  session_id?: string | null
 }
 /** ``replace_from`` is the column the accepted item replaces from. */
 export interface CompleteSlashResult {
@@ -1956,6 +1958,7 @@ export interface ProjectTreeNode {
   totalCostUsd?: number
   repos?: ProjectTreeRepo[]
   previewSessions?: ProjectTreeSession[]
+  sessionIds?: string[]
 }
 export interface ProjectTreeRepo {
   id: string
@@ -2131,6 +2134,7 @@ export interface PromptSubmitParams {
   queued?: boolean | null
   surface?: string | null
   voice_context?: string | null
+  title_preview?: string | null
   truncate_before_user_ordinal?: number | null
   truncate_before_row_id?: number | null
   truncate_before_message_id?: string | null
@@ -3409,7 +3413,10 @@ export interface SkillInspectInfo {
   skill_md_preview?: string | null
   [key: string]: unknown
 }
-export type SkillsReloadParams = Record<string, never>
+/** ``session_id`` binds the rescan to that session's profile and workspace (project skills). */
+export interface SkillsReloadParams {
+  session_id?: string | null
+}
 export interface SkillsReloadResult {
   output: string
   result: SkillsReloadDiff
@@ -3900,13 +3907,14 @@ export interface BillingBlock {
   message: string
   unverified?: boolean | null
 }
-/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint). */
+/** ``agent/error_surface.py::_surface`` — advisory {layer, code, retryable} (+ identity, + auth hint, + ``resets_at`` epoch seconds when the provider named when its limit lifts). */
 export interface ErrorSurface {
   layer: string
   code: string
   retryable: boolean
   provider?: string | null
   model?: string | null
+  resets_at?: number | null
   [key: string]: unknown
 }
 /** ``server._status_update`` and the direct emitters (goal / loop / heartbeat / process). */

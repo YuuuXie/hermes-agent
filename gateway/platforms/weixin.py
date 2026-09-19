@@ -65,28 +65,26 @@ _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*
 _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 
 
-# ``errmsg`` values that disambiguate a stale session from a genuine frequency
-# limit when iLink answers ret=-2. Both share the same ret, so the message is
-# the only signal.
-#
-# ``unknown error``  -- expired session (#17228).
-# ``prepare failed`` -- the stored ``context_token`` for the peer has gone
-#   stale. Hit by cron / proactive pushes specifically: the token is only
-#   refreshed by an *inbound* message, so an interactive reply always carries
-#   a fresh one while an unprompted push after a quiet period does not.
-#   Misfiling this as a rate limit skips the tokenless retry below -- which
-#   exists precisely to keep cron pushes working -- and instead burns the
-#   send on a 30s backoff loop until the chunk retries are exhausted.
-_STALE_SESSION_ERRMSGS = frozenset({"unknown error", "prepare failed"})
-
-
 def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
-    """ret/errcode=-2 with a stale-session ``errmsg`` is a stale-session signal (like -14), not a real rate limit."""
-    return (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) and (errmsg or "").lower() in _STALE_SESSION_ERRMSGS
+    """Recognize stale-session variants of iLink's ``-2`` response, not real rate limits."""
+    return (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) and (errmsg or "").lower() in {
+        "unknown error",
+        "prepare failed",
+    }
 
 
 def _is_session_expired(resp: Dict[str, Any], ret: Any, errcode: Any) -> bool:
-    return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
+    return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg") or resp.get("msg"))
+
+
+def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeError:
+    """The stale-session ``-2`` after the tokenless re-send is exhausted (or with no token to drop): iLink will not
+    prepare a bot-initiated send until this peer messages the bot again. Deterministic, so it is neither retried nor
+    fed to the rate-limit breaker (#80125). The text must not contain "rate limit" — ``classify_send_error`` would
+    route it back into the rate-limited redelivery lane."""
+    return RuntimeError(
+        f"iLink sendmessage session not ready: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}"
+        " — the user must send the bot a message first (or re-pair)")
 
 
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
@@ -915,12 +913,6 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
-    def _text_batch_key(self, event: MessageEvent) -> str:
-        from gateway.session import build_session_key
-        return build_session_key(
-            event.source, group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False), profile=event.source.profile)
-
     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
         spec = _INBOUND_MEDIA.get(item.get("type"))
         path, mime = await self._download_media(item, spec) if spec else (None, "")
@@ -980,9 +972,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return self._rate_limit_cooldown_remaining() > 0
 
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
-        """Send one text chunk with retry/backoff under the adapter-wide text gate. On session-expired (errcode -14)
-        retry once *without* ``context_token`` — iLink accepts tokenless sends as a degraded fallback, which keeps cron
-        pushes working when no user message refreshed the session."""
+        """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
+        or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
+        tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
+        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
             retried_without_token = False
@@ -996,35 +989,24 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+                        errmsg = resp.get("errmsg") or resp.get("msg")
                         if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
                             retried_without_token, context_token = True, None
                             self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
                             logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
                             continue
-
-                        errmsg = resp.get("errmsg") or resp.get("msg")
+                        if _is_stale_session_ret(ret, errcode, errmsg):
+                            # break, not raise: a raise here is caught below and re-enters the retry ladder.
+                            last_error = _session_not_ready_error(ret, errcode, errmsg)
+                            break
                         if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
                             raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
-                        if _is_stale_session_ret(ret, errcode, errmsg):
-                            # ret=-2 with a stale-session errmsg is NOT a frequency limit, so the
-                            # rate-limit arm below is the wrong medicine: it burns a backoff per chunk
-                            # and can trip the adapter-wide cooldown circuit, which then fast-fails
-                            # unrelated sends. The tokenless retry above is the only cure, and by this
-                            # point it is spent — either already attempted, or never available because
-                            # the send carried no context_token (the cron / proactive-push case).
-                            _spent = ("already attempted" if retried_without_token
-                                      else "unavailable (no context_token)")
-                            # break, not raise: the generic except-arm below would otherwise
-                            # retry the chunk against the same dead session for nothing.
-                            last_error = RuntimeError(
-                                f"iLink sendmessage stale session: ret={ret} errcode={errcode} "
-                                f"errmsg={errmsg or 'stale session'}; tokenless retry {_spent}")
-                            break
                         # Keep a descriptive error for when the loop exhausts while still limited.
                         last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
                         if self._record_rate_limit_event():
                             last_error = RuntimeError(
-                                f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                                f"iLink sendmessage rate limited (ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}); "
+                                f"cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
                             break
                         if attempt >= self._send_chunk_retries:
                             break
@@ -1199,6 +1181,8 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")
+                if _is_stale_session_ret(ret, errcode, errmsg):
+                    raise _session_not_ready_error(ret, errcode, errmsg)
                 raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
         return last_message_id
 
