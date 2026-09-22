@@ -36,6 +36,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -705,18 +706,39 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     def run(agent):
-        try:
-            agent._compress_context(messages, "sys", approx_tokens=120_000)
-        except Exception:
-            # Surface to the test if either raises — should not happen.
-            raise
+        # Surface any exception to the test via the future — should not happen.
+        return agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    t_a = threading.Thread(target=run, args=(agent_a,), name="main_turn")
-    t_b = threading.Thread(target=run, args=(agent_b,), name="review_fork")
-    t_a.start()
-    t_b.start()
-    t_a.join(timeout=10)
-    t_b.join(timeout=10)
+    # Both callers must have RETURNED before the state below is sampled.
+    #
+    # The previous form used ``Thread.join(timeout=10)`` and never asserted
+    # that the thread actually terminated. A timed join is a snapshot, not a
+    # completion proof: when the winner's commit-path SessionDB write is slow
+    # but still inside the product's own ``SessionDB._WRITE_PATIENCE_S`` (20s)
+    # retry budget, the 10s join expires while the winner is legitimately
+    # mid-commit and still holding its live lease. The assertions below then
+    # read a healthy in-progress lease as "lock leaked" and a not-yet-created
+    # child as ``children=0``. That is a false RED against correct product
+    # behaviour — the lease IS released, just after the test looked.
+    #
+    # ThreadPoolExecutor's context-manager exit joins BOTH callers with no
+    # timeout, so every assertion below observes terminal state, and
+    # ``future.result()`` re-raises anything either path raised (the old
+    # bare-thread form swallowed worker exceptions entirely). The barrier
+    # preserves the acquire/acquire race the test exists to exercise — either
+    # agent may win. The canonical runner's per-file watchdog remains the hard
+    # bound on a genuine hang; do not reintroduce a short unchecked join
+    # deadline, which only converts a slow commit into a spurious failure.
+    start = threading.Barrier(2)
+
+    def raced(agent):
+        start.wait(timeout=10)
+        return run(agent)
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="compression-race") as pool:
+        futures = [pool.submit(raced, agent) for agent in (agent_a, agent_b)]
+        for future in futures:
+            future.result()
 
     # The invariant Damien's incident is about: the parent must NEVER end up
     # with two (or more) children — that is the transcript fork. The lock
@@ -768,6 +790,21 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     # whether the winner committed a child or rolled back.
     assert db.get_compression_lock_holder(parent_sid) is None, (
         "Compression lock leaked: still held after both paths completed."
+    )
+
+    # Strengthening (not a relaxation): the lock must serialize the expensive
+    # summary work too, not merely the child-row write. A rollback outcome
+    # (children == 0) would otherwise satisfy every assertion above even if
+    # BOTH agents had been admitted and each burned a summary call on the same
+    # parent — the pre-lock behaviour. The loser either defers ("Skipping
+    # concurrent compression") or late-adopts the winner's child; neither path
+    # needs a summary, so the combined count is at most one.
+    summary_calls = sum(
+        a.context_compressor.compress.call_count for a in (agent_a, agent_b)
+    )
+    assert summary_calls <= 1, (
+        f"Both compression paths ran a summary ({summary_calls} compress calls) on "
+        f"session {parent_sid} — the lock did not serialize the attempts."
     )
 
 
