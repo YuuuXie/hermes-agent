@@ -951,6 +951,13 @@ def _run_pinned_compression_retry(
     ceiling = max(float(total_ceiling_seconds), idle)
     deterministic = route.get("deterministic") is True
     if deterministic:
+        # The deterministic rung skips the summary LLM and builds the static fallback summary locally,
+        # so nothing in it ever streams a token and nothing ever calls ``fence.touch_progress()``. Held
+        # to the token-idle budget it measures host CPU time, not provider health: a build slower than
+        # one idle window makes the host cancel its own commit fence and report "produced no
+        # compression" — exactly the degradation this last rung exists to prevent. Bound it by the
+        # shared wall-clock ceiling alone, which still stops a runaway build.
+        idle = ceiling
         logger.warning(
             "Context compression stalled on every summary route — committing the %s (no summary model) "
             "before continuing without compression", route["label"],
