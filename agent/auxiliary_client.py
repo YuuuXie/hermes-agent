@@ -346,6 +346,36 @@ def _aux_progress_active() -> bool:
     return getattr(_aux_progress, "hook", None) is not None
 
 
+# Hook ticked when a worker phase leaves the provider entirely (local-only summary assembly). A host
+# policing token-idle silence must stop counting from here: there is no stream left that could ever
+# emit a token, so continued silence is expected, not evidence of a hung provider. Thread-local like
+# the other aux hooks, and propagated into the provider daemon by _run_protected_sync_provider_call.
+_aux_local_only_phase = threading.local()
+
+
+@contextlib.contextmanager
+def aux_local_only_phase_hook(hook):
+    """Install *hook* as this thread's local-only-phase callback (None = passthrough)."""
+    with _aux_thread_local_hook(_aux_local_only_phase, hook):
+        yield
+
+
+def _notify_aux_local_only_phase() -> None:
+    """Declare that the rest of this attempt runs locally with no provider stream.
+
+    The token-idle fence exists to tell a slow-but-alive provider from a hung one, and it is fed
+    exclusively by ``_notify_aux_provider_response``. Once a worker falls back to a locally built static
+    summary there is no provider left to emit tokens, so every further second of silence is charged to a
+    progress source that no longer exists — the host cancels its own commit fence mid-build and the
+    fallback reports "produced no compression". Ticking this hook lets the host suspend the idle budget
+    for that leg while its total wall-clock ceiling keeps bounding it.
+    """
+    _tick_hook(_aux_local_only_phase, "local-only phase")
+    # Also publish one ordinary progress tick, so a host that watches only the fence's last-progress
+    # stamp still sees the phase boundary instead of inheriting the stalled provider's stale stamp.
+    _notify_aux_progress()
+
+
 def _field(obj: Any, key: str, default: Any = None) -> Any:
     """Field access for wire objects that may be dicts or SDK/SimpleNamespace objects."""
     val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
@@ -455,6 +485,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
     # Thread-locals do not cross into the daemon: timing hooks fire from the thread running
     # the callback, and the host deadline is inert unless carried along.
     progress_hook = getattr(_aux_progress, "hook", None)
+    local_only_hook = getattr(_aux_local_only_phase, "hook", None)
     dispatch_hook = getattr(_aux_dispatch, "hook", None)
     provider_response_hook = getattr(_aux_provider_response, "hook", None)
     host_deadline = _current_aux_stream_deadline()
@@ -469,6 +500,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
         try:
             with (
                 aux_progress_hook(progress_hook),
+                aux_local_only_phase_hook(local_only_hook),
                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
                 aux_stream_deadline(host_deadline),

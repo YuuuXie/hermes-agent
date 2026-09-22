@@ -430,6 +430,8 @@ class CompressionCommitFence:
         # Touched per streamed token so waiters tell SLOW-but-alive from HUNG (no fixed wall-clock kill).
         self._last_progress = time.monotonic()
         self._progress_observed = False
+        # Set once the worker leaves the provider for a local-only build; suspends the idle budget.
+        self._local_only_phase = False
         self._deadline: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
         # Set once the active-row watermark is captured: later rows survive as tail, so hosts may keep admission.
@@ -448,6 +450,24 @@ class CompressionCommitFence:
         """Record forward progress (a streamed token); a bare float store is atomic, so no lock."""
         self._last_progress = time.monotonic()
         self._progress_observed = True
+
+    def enter_local_only_phase(self) -> None:
+        """The worker left the provider: no stream remains that could emit a token.
+
+        The idle budget distinguishes a slow-but-alive provider from a hung one, so it is only
+        meaningful while a provider stream exists. Once the worker falls back to a locally built static
+        summary, further silence is guaranteed and expected — charging it to the idle timer makes the
+        host cancel its own commit fence mid-build and degrade the very fallback that was supposed to
+        guarantee a handoff. Waiters stop applying the idle budget from here; ``deadline_exceeded`` /
+        the total wall-clock ceiling still bound a runaway local build.
+        """
+        self._local_only_phase = True
+        self.touch_progress()
+
+    @property
+    def local_only_phase(self) -> bool:
+        """Whether the worker has entered a provider-free, local-only phase."""
+        return self._local_only_phase
 
     @property
     def progress_observed(self) -> bool:
@@ -1012,6 +1032,13 @@ def _await_worker_within_budget(
         remaining_ceiling = ceiling - waited
         if remaining_ceiling <= 0:
             return False, None
+        # A local-only phase has no provider stream left, so the idle budget has no source to measure;
+        # only the total ceiling still applies (see CompressionCommitFence.enter_local_only_phase).
+        if fence.local_only_phase:
+            try:
+                return True, future.result(timeout=remaining_ceiling)
+            except concurrent.futures.TimeoutError:
+                return False, None
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
         wait_slice = min(max(idle - since_progress, 0.005), remaining_ceiling)
@@ -1020,6 +1047,9 @@ def _await_worker_within_budget(
         except concurrent.futures.TimeoutError:
             waited = time.monotonic() - wait_started
             since_progress = fence.seconds_since_progress()
+            if fence.local_only_phase:
+                # The worker crossed into the local-only build while we were waiting out this slice.
+                continue
             if not fence.deadline_exceeded and since_progress < idle and waited < ceiling:
                 logger.info(
                     "Context compression still streaming after %.0fs (last progress %.1fs ago) — extending wait (ceiling %.0fs)",
@@ -2920,8 +2950,13 @@ def _run_summary_dispatch(
     # Publish progress to the commit fence so hosts extend deadlines while tokens
     # flow. Any active hook (even no-op) selects the streamed path: the timeout is
     # inactivity-based and a byte-trickling provider hits the stream total ceiling.
-    from agent.auxiliary_client import aux_interrupt_protection, aux_progress_hook, aux_stream_deadline
+    from agent.auxiliary_client import (
+        aux_interrupt_protection, aux_local_only_phase_hook, aux_progress_hook, aux_stream_deadline,
+    )
     _progress_hook = commit_fence.touch_progress if commit_fence is not None else (lambda: None)
+    # The static-fallback build runs with no provider left to stream, so the idle timer loses its
+    # source; this hook tells the waiting host to fall back to the total ceiling for that leg.
+    _local_only_hook = commit_fence.enter_local_only_phase if commit_fence is not None else (lambda: None)
     # Return leg: cancel frees the owner but the provider daemon streams on to its
     # own larger ceiling; share the host deadline so orphan streams stop with it.
     _host_stream_deadline = commit_fence.deadline_monotonic if commit_fence is not None else None
@@ -2952,7 +2987,8 @@ def _run_summary_dispatch(
             compressed = messages
         else:
             with (
-                aux_progress_hook(_progress_hook), aux_stream_deadline(_host_stream_deadline),
+                aux_progress_hook(_progress_hook), aux_local_only_phase_hook(_local_only_hook),
+                aux_stream_deadline(_host_stream_deadline),
                 aux_interrupt_protection(cancel_check=_compression_cancel_requested),
             ):
                 # This attempt is now doing real summary work: publish it as the working attempt so later

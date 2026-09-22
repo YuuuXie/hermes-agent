@@ -18,6 +18,7 @@ from agent.image_eviction_policy import outbound_image_retire_count
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
     _is_connection_error,
+    _notify_aux_local_only_phase,
     aux_interrupt_protection,
     call_llm,
     extract_content_or_reasoning,
@@ -4831,6 +4832,16 @@ Write only the summary body. Do not include any preamble or prefix."""
         n_dropped: int, feasibility_skip: bool,
     ) -> str:
         """Deterministic fallback so the model gets recoverable continuity anchors."""
+        # The static fallback build and everything after it (assemble + commit admission) is local-only:
+        # it calls no provider, so nothing below ever reaches ``_notify_aux_provider_response`` and the
+        # host's token-idle fence gets no progress for the rest of the attempt. Held to the token-idle
+        # budget that leg measures host CPU time, not provider health — a local build slower than one idle
+        # window makes the host cancel its own commit fence and report "produced no compression", exactly
+        # the degradation this fallback exists to prevent. c6d22b2 fixed this for the deterministic rung
+        # (route deterministic=True); the identical hole remains on every route that reaches the static
+        # fallback after its provider call FAILED. Publish the phase change so the host stops charging
+        # provider-silence to a source that no longer exists. The total wall-clock ceiling still bounds it.
+        _notify_aux_local_only_phase()
         if not self.quiet_mode and feasibility_skip:
             logger.info("Feasibility skip — inserting deterministic fallback context summary")
         elif not self.quiet_mode:
