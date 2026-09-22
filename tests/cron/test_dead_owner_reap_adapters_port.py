@@ -33,7 +33,9 @@ def executions(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fresh_reap_window(monkeypatch):
-    monkeypatch.setattr(scheduler_mod, "_last_dead_owner_reap_at", None)
+    # Upstream made the reap throttle a per-HERMES_HOME dict (was a single Optional[float]);
+    # an empty dict is the "never reaped yet" sentinel that forces a reap on this tick.
+    monkeypatch.setattr(scheduler_mod, "_last_dead_owner_reap_at", {})
 
 
 def _dead_pid() -> int:

@@ -282,6 +282,9 @@ def test_near_deadline_handoff_is_sent_exactly_once(monkeypatch):
 
 
 def test_no_handoff_steer_when_grace_disabled(monkeypatch):
-    child, entry = _run_child_to_timeout(monkeypatch, timeout=1.0, grace=None)
+    _child, entry = _run_child_to_timeout(monkeypatch, timeout=1.0, grace=None)
     assert entry["status"] == "timeout"
-    assert child.steers == []
+    # Grace disabled means no NEAR-DEADLINE HANDOFF steer. Upstream's inactivity budget warning
+    # (#116001, tests/tools/test_delegate_liveness_timeout.py) is a different notice on the same
+    # channel and is expected here, so assert on the handoff text rather than on an empty list.
+    assert [s for s in _child.steers if "approaching your hard time limit" in s] == []

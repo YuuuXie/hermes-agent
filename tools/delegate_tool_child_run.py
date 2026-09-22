@@ -233,6 +233,50 @@ def _dump_subagent_timeout_diagnostic(
 
 # ── Per-run helpers ──────────────────────────────────────────────────────────
 
+# Granularity for re-checking a child's progress while a configured ``child_timeout_seconds`` budget runs.
+# Five seconds is finer than the 30s heartbeat and cheap (one activity-summary read per slice).
+_LIVENESS_POLL_SECONDS = 5.0
+# Fraction of the inactivity budget after which the child is warned once (via its steer channel) that the window is
+# closing, so a child that is merely slow can wrap up and return instead of losing its whole context (#116001).
+_BUDGET_WARNING_FRACTION = 0.8
+
+def _budget_warning_text(idle_seconds: float, child_timeout: float) -> str:
+    return (
+        f"[delegation budget warning] No progress signal for {idle_seconds:.0f}s of your {child_timeout:.0f}s "
+        "inactivity window. Finish the current step and return your summary now — the work is discarded if the "
+        "window elapses."
+    )
+
+def _warn_child_budget(child: Any, idle_seconds: float, child_timeout: float) -> None:
+    """Queue the one-line warning through the child's steer path (delivered at its next iteration boundary)."""
+    steer = getattr(child, "steer", None)
+    if not callable(steer):
+        return
+    try:
+        steer(_budget_warning_text(idle_seconds, child_timeout))
+    except Exception as exc:
+        logger.debug("budget warning steer failed: %s", exc)
+
+def _child_activity_fingerprint(child: Any) -> tuple:
+    """``(completed calls, current tool, activity clock)`` — the progress signals the heartbeat's stale verdict
+    already watches. A child waiting on an in-flight LLM completion is ALIVE: its activity clock ticks while the
+    provider works (``direct_api_call``'s 15s heartbeat) and the call itself is bounded by the per-call stale
+    watchdog, so at the delegation layer it must not read as stuck (#116001)."""
+    try:
+        summary = child.get_activity_summary() or {}
+    except Exception:
+        return (None, None, None)
+    return (summary.get("api_call_count"), summary.get("current_tool"), summary.get("last_activity_ts"))
+
+def _child_last_event_age(child: Any) -> Optional[float]:
+    """Seconds since the child's activity clock last ticked, or None when the child exposes no clock. Reported on a
+    timeout so an operator can tell a slow-but-live provider from a runaway without transcript forensics."""
+    try:
+        ts = (child.get_activity_summary() or {}).get("last_activity_ts")
+        return round(max(0.0, time.time() - float(ts)), 2) if ts is not None else None
+    except Exception:
+        return None
+
 class _Heartbeat:
     """One child's parent-activity heartbeat via the shared periodic scheduler
     (``agent.periodic_scheduler``) — not one daemon thread per child. NOT started at construction:
@@ -834,6 +878,88 @@ class _ChildRun:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
         return _close_subagent_steering(self.subagent_id, self.child) if self.subagent_id else None
 
+    def wait_liveness_aware(
+        self, settled: threading.Event, child_future: Any, child_timeout: Optional[float],
+        *, release_stale_wait: bool = True, handoff_grace: Optional[float] = None,
+    ) -> None:
+        """Wait for the worker or the stale verdict, where ``child_timeout`` bounds INACTIVITY, not total runtime.
+
+        A configured cap used to be a dispatch-to-death stopwatch, so it only ever killed children the runtime had
+        already judged healthy: all 75 reported deaths happened while waiting on an in-flight LLM completion, none
+        mid-tool (#116001). A provider serving multi-minute completions is progress — the child's activity clock
+        ticks during the wait and the request is bounded by the per-call stale watchdog — so the budget restarts on
+        every sign of progress, exactly the signals the heartbeat's stale verdict reads. Genuinely frozen children
+        keep two authorities: this budget (when configured) and the heartbeat's stale threshold.
+
+        Two local behaviours ride along (both have dedicated tests, so "just take upstream" here is a regression):
+        ``release_stale_wait=False`` (a DETACHED unit) means a stale verdict must NOT end the wait — only the worker
+        or the inactivity budget may — and ``handoff_grace`` fires the near-deadline handoff steer exactly once,
+        measured BACKWARDS from the current window's end so it never extends the wait.
+        """
+        handoff_sent = False
+
+        def _arm(now: float) -> tuple[Optional[float], Optional[float], Optional[float]]:
+            """(deadline, warn_at, handoff_at) for a fresh inactivity window."""
+            if child_timeout is None:
+                return None, None, None
+            _deadline = now + child_timeout
+            _warn_at = _deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
+            _handoff_at: Optional[float] = None
+            if handoff_grace is not None and handoff_grace > 0:
+                _handoff_at = _deadline - min(float(handoff_grace), child_timeout / 2.0)
+            return _deadline, _warn_at, _handoff_at
+
+        deadline, warn_at, handoff_at = _arm(time.monotonic())
+        warned = False
+        fingerprint = _child_activity_fingerprint(self.child)
+        while True:
+            if child_future.done():
+                return
+            now = time.monotonic()
+            if release_stale_wait and settled.is_set():
+                return  # the worker finished, or the heartbeat declared the child stale
+            if deadline is not None and now >= deadline:
+                return  # no progress for the whole budget
+            if handoff_at is not None and not handoff_sent and now >= handoff_at:
+                handoff_sent = True  # attempted exactly once, whether or not the steer lands
+                # The handoff steer already says everything the budget warning would, with
+                # instructions, so one notice per window: mark the warning spent ONLY when the
+                # steer actually landed. If it did not (no subagent id, child already finishing),
+                # the child must still get the plain budget warning at 80%.
+                if self.send_handoff_steer():
+                    warned = True
+                continue
+            wait = _LIVENESS_POLL_SECONDS
+            if deadline is not None:
+                wait = min(wait, deadline - now)
+                if not warned and warn_at is not None:
+                    wait = min(wait, max(warn_at - now, 0.0))
+            if handoff_at is not None and not handoff_sent:
+                wait = min(wait, max(handoff_at - now, 0.0))
+            if release_stale_wait:
+                settled.wait(timeout=wait)
+                if settled.is_set():
+                    return
+            else:
+                # Detached unit: ``settled`` is unusable as the wake-up, so sleep on the Future itself.
+                try:
+                    child_future.result(timeout=wait)
+                except FuturesTimeoutError:
+                    pass  # this slice simply expired; re-check progress below
+                except Exception:
+                    return  # the child raised — the caller re-reads the Future and reports it
+                if child_future.done():
+                    return
+            current = _child_activity_fingerprint(self.child)
+            if current != fingerprint:
+                fingerprint = current
+                deadline, warn_at, handoff_at = _arm(time.monotonic())
+                warned = False  # a fresh window gets its own warning
+            elif not warned and warn_at is not None and time.monotonic() >= warn_at:
+                warned = True
+                _warn_child_budget(
+                    self.child, child_timeout - (deadline - time.monotonic()), child_timeout)
+
     def await_child(
         self, heartbeat: _Heartbeat, *, release_stale_wait: bool = True,
     ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
@@ -879,61 +1005,33 @@ class _ChildRun:
         # One event covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway
-        # inactivity watchdog (#109749).
+        # inactivity watchdog (#109749). The configured cap bounds INACTIVITY (see wait_liveness_aware).
         settled = self.heartbeat.settled if self.heartbeat is not None else threading.Event()
         future.add_done_callback(lambda _f: settled.set())
         # Set when the stale verdict — not the configured cap — ended the wait; the entry must name that cause.
         stale_after: Optional[float] = None
-        timeout_deadline = time.monotonic() + child_timeout if child_timeout is not None else None
-        # Near-deadline handoff cutoff (ours), measured BACKWARDS from the existing hard deadline: this never
-        # extends the wait. Clamped to half the timeout so a grace >= the timeout cannot fire before the child
-        # has done anything.
-        handoff_deadline: Optional[float] = None
-        if timeout_deadline is not None and child_timeout is not None:
+        # Near-deadline handoff grace (ours). ``wait_liveness_aware`` measures it BACKWARDS from the end of the
+        # CURRENT inactivity window, so it never extends the wait, and re-arms with the window when the child
+        # makes progress. Clamped there to half the timeout so a grace >= the timeout cannot fire immediately.
+        handoff_grace: Optional[float] = None
+        if child_timeout is not None:
             grace = _get_handoff_grace_seconds()
             if grace is not None and grace > 0:
-                handoff_deadline = timeout_deadline - min(float(grace), child_timeout / 2.0)
-        handoff_sent = False
+                handoff_grace = float(grace)
         try:
-            while True:
-                if future.done():
-                    return future.result(), None, False
-                now = time.monotonic()
-                if release_stale_wait and settled.is_set():
-                    # ``settled`` has TWO setters (the stale verdict and the worker's done-callback),
-                    # so re-read the Future first: it may have completed since the check above, and a
-                    # finished child's result must never be discarded as a timeout.
-                    if future.done():
-                        return future.result(), None, False
-                    stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
-                    raise FuturesTimeoutError()
-                if timeout_deadline is not None and now >= timeout_deadline:
-                    raise FuturesTimeoutError()
-                if handoff_deadline is not None and not handoff_sent and now >= handoff_deadline:
-                    handoff_sent = True  # exactly once, whether or not the steer lands
-                    self.send_handoff_steer()
-                    continue
-                # Block until the next event of interest instead of polling: the settled event, the hard
-                # deadline, or the handoff cutoff — whichever is nearest.
-                wait_seconds: Optional[float] = None
-                if timeout_deadline is not None:
-                    wait_seconds = timeout_deadline - now
-                if handoff_deadline is not None and not handoff_sent:
-                    _to_handoff = handoff_deadline - now
-                    wait_seconds = _to_handoff if wait_seconds is None else min(wait_seconds, _to_handoff)
-                if release_stale_wait:
-                    settled.wait(timeout=wait_seconds)
-                    continue
-                # Detached unit (release_stale_wait=False): a stale verdict must NOT end the wait, so
-                # ``settled`` is unusable as the wake-up — only the Future or the configured cap may end it.
-                try:
-                    return future.result(timeout=wait_seconds), None, False
-                except FuturesTimeoutError:
-                    # A child may itself raise TimeoutError. Once the Future is done, re-read it so the outer
-                    # exception path reports that child error instead of mistaking it for this polling slice.
-                    if future.done():
-                        return future.result(), None, False
-                    continue
+            self.wait_liveness_aware(
+                settled, future, child_timeout,
+                release_stale_wait=release_stale_wait, handoff_grace=handoff_grace,
+            )
+            if future.done():
+                # A finished child's result must never be discarded as a timeout: ``settled`` has TWO
+                # setters (the stale verdict and the worker's done-callback), so the Future is the
+                # authority on whether real work came back.
+                return future.result(), None, False
+            if release_stale_wait and settled.is_set():
+                # The stale verdict, not the configured cap, ended the wait — name that cause.
+                stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
+            raise FuturesTimeoutError()
         except Exception as wait_exc:
             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
         finally:
@@ -987,8 +1085,9 @@ class _ChildRun:
             )
         else:
             _err = (
-                f"Subagent timed out after {child_timeout}s with {child_api_calls} API call(s) completed — likely "
-                f"stuck on a slow API call, tool call, or unresponsive network request."
+                f"Subagent timed out after {child_timeout}s with {child_api_calls} API call(s) completed — no "
+                f"progress in that window (no completed call, tool change, or activity-clock tick): a stalled "
+                f"provider request or an unresponsive network request."
             )
         if diagnostic_path:
             _err += f" Diagnostic: {diagnostic_path}"
@@ -1002,6 +1101,9 @@ class _ChildRun:
                 "before_first_llm_call" if before_first_call else
                 "stale_after_llm_calls" if stale_watchdog else "after_llm_calls" if is_timeout else None
             ),
+            # How long the child had been silent when the wait ended: distinguishes a slow provider from a runaway
+            # without transcript forensics (#116001).
+            "last_event_age": _child_last_event_age(child) if is_timeout else None,
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
