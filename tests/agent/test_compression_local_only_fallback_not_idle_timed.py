@@ -61,6 +61,21 @@ def _run(build_seconds: float, *, announce: bool):
     return settled, result, outcome
 
 
+def test_local_phase_hook_does_not_invent_provider_output():
+    from agent.auxiliary_client import (
+        _notify_aux_local_only_phase, aux_local_only_phase_hook, aux_progress_hook,
+    )
+
+    for provider_output_seen in (False, True):
+        fence = CompressionCommitFence(total_ceiling_seconds=CEILING)
+        if provider_output_seen:
+            fence.touch_progress()
+        with aux_progress_hook(fence.touch_progress), aux_local_only_phase_hook(fence.enter_local_only_phase):
+            _notify_aux_local_only_phase()
+        assert fence.local_only_phase is True
+        assert fence.progress_observed is provider_output_seen
+
+
 def test_local_only_build_longer_than_the_idle_window_still_commits():
     """The failing-pinned-route build outruns the idle budget but stays under the ceiling: it must commit."""
     settled, result, outcome = _run(IDLE * 4, announce=True)

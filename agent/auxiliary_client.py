@@ -371,9 +371,7 @@ def _notify_aux_local_only_phase() -> None:
     for that leg while its total wall-clock ceiling keeps bounding it.
     """
     _tick_hook(_aux_local_only_phase, "local-only phase")
-    # Also publish one ordinary progress tick, so a host that watches only the fence's last-progress
-    # stamp still sees the phase boundary instead of inheriting the stalled provider's stale stamp.
-    _notify_aux_progress()
+    # Do not tick provider progress: a local phase emits no summary output.
 
 
 def _field(obj: Any, key: str, default: Any = None) -> Any:

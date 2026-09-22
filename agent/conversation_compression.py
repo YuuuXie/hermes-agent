@@ -462,7 +462,8 @@ class CompressionCommitFence:
         the total wall-clock ceiling still bound a runaway local build.
         """
         self._local_only_phase = True
-        self.touch_progress()
+        # A phase boundary is not evidence of provider output.
+        self._last_progress = time.monotonic()
 
     @property
     def local_only_phase(self) -> bool:
