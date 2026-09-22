@@ -35,7 +35,8 @@ def test_interrupt_does_not_join_wedged_child():
         _interrupt_requested=False, _delegate_spinner=None, quiet_mode=True,
     )
 
-    def run_child(i, task, child):
+    def run_child(i, task, child, *, release_stale_wait=True):
+        assert release_stale_wait is True
         if i == 0:
             wedged_started.set()
             wedged_release.wait()  # parked until test teardown
@@ -76,7 +77,8 @@ def test_normal_completion_still_joins_cleanly():
         _interrupt_requested=False, _delegate_spinner=None, quiet_mode=True,
     )
 
-    def run_child(i, task, child):
+    def run_child(i, task, child, *, release_stale_wait=True):
+        assert release_stale_wait is True
         return {"task_index": i, "status": "completed", "summary": f"s{i}",
                 "error": None, "api_calls": 1, "duration_seconds": 0}
 
