@@ -33,7 +33,8 @@ def executions(monkeypatch, tmp_path):
 
 @pytest.fixture(autouse=True)
 def _fresh_reap_window(monkeypatch):
-    monkeypatch.setattr(scheduler_mod, "_last_dead_owner_reap_at", None)
+    # Per-home reap throttle map (upstream made this a dict keyed by home); empty = reap now.
+    monkeypatch.setattr(scheduler_mod, "_last_dead_owner_reap_at", {})
 
 
 def _dead_pid() -> int:
