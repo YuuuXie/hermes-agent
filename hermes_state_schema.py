@@ -1301,7 +1301,33 @@ def reconcile_state_schema(conn: sqlite3.Connection) -> None:
     reconciliation, so out-of-band openers can never grow a second
     hand-maintained shape for the same durable tables.
     """
-    conn.executescript(SCHEMA_SQL)
+    # executescript otherwise commits each DDL independently: a cold delegation
+    # ledger pays a durable fsync sequence for every table/index and siblings
+    # can observe a partially initialized store. Keep the canonical creation
+    # batch atomic. A deferred transaction leaves an already-current schema
+    # read-only, including when another connection holds the writer reservation.
+    busy_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    deadline = time.monotonic() + busy_timeout_ms / 1000
+    try:
+        try:
+            conn.executescript("BEGIN;\n" + SCHEMA_SQL + "\nCOMMIT;")
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            # A stale schema can require a read-to-write upgrade. SQLite may
+            # reject that upgrade immediately rather than invoke its busy
+            # handler. Retry with the reservation acquired before any reads,
+            # using only the original busy budget still available.
+            remaining_ms = int(max(0, deadline - time.monotonic()) * 1000)
+            if (getattr(exc, "sqlite_errorcode", 0) & 0xFF) != sqlite3.SQLITE_BUSY or remaining_ms <= 0:
+                raise
+            conn.execute(f"PRAGMA busy_timeout={remaining_ms}")
+            try:
+                conn.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL + "\nCOMMIT;")
+            finally:
+                conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except BaseException:
+        conn.rollback()
+        raise
     # _reconcile_columns only touches the staticmethod _parse_schema_columns,
     # so a bare instance works; reusing it keeps one reconciliation
     # implementation (one authority) instead of a near-copy on raw
