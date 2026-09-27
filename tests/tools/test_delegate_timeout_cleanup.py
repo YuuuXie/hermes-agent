@@ -36,11 +36,11 @@ class _SlowUnwindingChild:
         self.started.set()
         # Generous bounds: these gate on events the test sets promptly; a tight bound only
         # turns a load-starved test thread into a spurious early exit that fires close().
-        assert self.interrupted.wait(timeout=10)
+        assert self.interrupted.wait(timeout=30)
         # Model the real child turn's finally path: it still performs session
         # activity/SQLite cleanup after the parent requests interruption.
         self.unwinding.set()
-        assert self.allow_finish.wait(timeout=10)
+        assert self.allow_finish.wait(timeout=30)
         self.finished.set()
         return {
             "final_response": "",
@@ -77,24 +77,27 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
-    result_holder = {}
-    parent_done = threading.Event()
+    from tools.daemon_pool import DaemonThreadPoolExecutor
 
-    def run_parent() -> None:
-        result_holder["result"] = delegate_tool._run_single_child(
-            task_index=0,
-            goal="exercise timeout teardown",
-            child=child,
-            parent_agent=parent,
-        )
-        parent_done.set()
+    submit = DaemonThreadPoolExecutor.submit
 
-    parent_thread = threading.Thread(target=run_parent)
-    parent_thread.start()
+    def submit_started(executor, *args, **kwargs):
+        future = submit(executor, *args, **kwargs)
+        assert child.started.wait(timeout=10)
+        return future
+
+    # Timeout accounting starts only after this test's child is running.
+    monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_started)
+    result = delegate_tool._run_single_child(
+        task_index=0,
+        goal="exercise timeout teardown",
+        child=child,
+        parent_agent=parent,
+    )
+
+    assert result["status"] == "timeout"
+    assert child.unwinding.wait(timeout=10)
     try:
-        assert parent_done.wait(timeout=5), "timed-out parent did not return"
-        assert result_holder["result"]["status"] == "timeout"
-        assert child.unwinding.wait(timeout=1)
         assert not child.closed.is_set(), (
             "timed-out child.close() ran before its conversation thread unwound"
         )
@@ -108,10 +111,8 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
         assert not child.closed.is_set()
     finally:
         child.allow_finish.set()
-        parent_thread.join(timeout=5)
-    assert not parent_thread.is_alive()
-    assert child.finished.wait(timeout=1)
-    assert child.closed.wait(timeout=1)
+    assert child.finished.wait(timeout=10)
+    assert child.closed.wait(timeout=10)
     assert not child.close_while_running, (
         "timed-out child.close() raced its still-running conversation thread"
     )
