@@ -209,11 +209,17 @@ class TestSyncMode:
             "deliver": "local",
         }
 
-        barrier = threading.Barrier(2, timeout=5)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
 
         def slow_run(j, *, defer_agent_teardown=None, **_kw):
-            barrier.wait()  # blocks until test thread also waits
-            return True, "out", "resp", None
+            started.set()
+            try:
+                assert release.wait(timeout=10), "test did not release the held job"
+                return True, "out", "resp", None
+            finally:
+                finished.set()
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
@@ -222,14 +228,12 @@ class TestSyncMode:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        start = time.monotonic()
-        n = sched.tick(verbose=False, sync=False)  # opt-in: non-blocking
-        elapsed = time.monotonic() - start
-
-        assert n == 1  # optimistic count
-        assert elapsed < 1.0  # returned immediately, didn't wait for slow_run
-
-        # Let the job finish so cleanup works.
-        barrier.wait()
-        time.sleep(0.1)
-        sched._shutdown_parallel_pool()
+        try:
+            n = sched.tick(verbose=False, sync=False)  # opt-in: non-blocking
+            assert n == 1  # optimistic count
+            assert started.wait(timeout=10)
+            assert not finished.is_set(), "tick waited for the held job"
+        finally:
+            release.set()
+            assert finished.wait(timeout=10)
+            sched._shutdown_parallel_pool()
