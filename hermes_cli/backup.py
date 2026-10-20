@@ -361,6 +361,24 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
             else:
                 busy_deadline = now + max(0.0, timeout_seconds)
 
+        # Pin one WAL read generation. Without a read transaction, any concurrent
+        # writer can restart the incremental backup from page one indefinitely.
+        # A rollback-journal writer can temporarily hold an exclusive lock here;
+        # sqlite's timeout is zero, so retry only busy/locked until our deadline.
+        conn.execute("BEGIN")
+        while True:
+            try:
+                conn.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+                break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xff not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                remaining = busy_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _SQLiteBackupTimeout(
+                        f"database remained locked for {timeout_seconds:g} seconds") from exc
+                time.sleep(min(0.05, remaining))
         conn.backup(backup_conn, pages=256, progress=_check_backup_progress, sleep=0.1)
         return True
     except Exception as exc:
@@ -584,8 +602,9 @@ def _write_zip_entries(
     *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
     """Add every ``(abs_path, rel_path)`` to *zf*, WAL-safe for ``*.db``; return bytes archived.
 
-    ``on_db_failure(rel_path)`` runs when a SQLite snapshot fails (may raise to abort);
-    ``on_error(rel_path, exc)`` records a read failure; ``on_progress(i)`` fires every 500 files;
+    ``on_db_failure(rel_path)`` runs when a SQLite archive entry fails (snapshot, staging,
+    or zip write; may raise to abort); ``on_error(rel_path, exc)`` records a plain-file read
+    failure; ``on_progress(i)`` fires every 500 files;
     ``track_bytes`` stats plain files for the size total.
     """
     total_bytes = 0
@@ -602,7 +621,11 @@ def _write_zip_entries(
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
         except (PermissionError, OSError, ValueError) as exc:
-            on_error(rel_path, exc)
+            if abs_path.suffix == ".db":
+                logger.warning("SQLite archive entry failed for %s: %s", rel_path, exc)
+                on_db_failure(rel_path)
+            else:
+                on_error(rel_path, exc)
             continue
         if i % 500 == 0:
             on_progress(i)
@@ -705,11 +728,15 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         print(f"  {i}/{file_count} files ...")
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
+    def _db_failure(rel: Path) -> None:
+        print(f"Backup failed: {rel}: SQLite safe copy failed; previous archive was not replaced.")
+        raise SystemExit(1)
+
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
-            on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
+            on_db_failure=_db_failure,
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
         # External memory-provider state never includes ``.db`` files in practice, so a
         # straight zf.write is fine.
