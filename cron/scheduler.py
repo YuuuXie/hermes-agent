@@ -4186,6 +4186,7 @@ def _alert_reclaimed_execution(record: dict, *, adapters=None, loop=None) -> Non
         outcome = _classify_delivery_outcome(
             delivery_error=delivery_error,
             delivery_queued=job.get("last_delivery_queued"),
+            notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
             should_deliver=True,
             unresolved_origin=bool(not delivery_error and normalized_deliver == "origin"
                                    and not _resolve_delivery_targets(job, for_failure=True)),

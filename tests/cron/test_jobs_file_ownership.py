@@ -169,7 +169,7 @@ class TestTickerLoopRecordsErrors:
         from cron.scheduler_provider import InProcessCronScheduler
 
         provider = InProcessCronScheduler()
-        monkeypatch.setattr(provider, "recover_interrupted", lambda: 0)
+        monkeypatch.setattr(provider, "recover_interrupted", lambda **_context: 0)
         monkeypatch.setattr("cron.scheduler.tick", tick_fn)
 
         stop_event = threading.Event()
