@@ -265,9 +265,9 @@ __all__ = [
     "check_stale",
     "get_registry",
     "known_reads",
-    "writes_by",
     "lock_path",
     "note_write",
     "record_read",
+    "writes_by",
     "writes_since",
 ]
