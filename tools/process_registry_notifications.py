@@ -252,6 +252,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
             lines += ["Partial output:", r_summary]
         else:
             lines.append(f"(no summary — status={r_status}" + (f": {r_error}" if r_error else "") + ")")
+        lines += _timeout_evidence_lines(r)
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
         lines += _process_accounting_lines(r)
@@ -274,6 +275,22 @@ def _process_accounting_lines(r: dict) -> list:
     for u in r.get("unread_completions") or []:
         lines.append(f"Child's process {u.get('session_id')} `{u.get('command', '')[:100]}` finished (exit code "
                      f"{u.get('exit_code')}) but the child never read its result; output tail:\n{u.get('output_tail', '')}")
+    return lines
+
+def _timeout_evidence_lines(result: dict) -> list[str]:
+    if result.get("status") != "timeout":
+        return []
+    lines = []
+    for row in result.get("partial_output_tail") or []:
+        if isinstance(row, dict) and row.get("preview"):
+            lines.append(f"Completed {row.get('tool', 'tool')} output: {row['preview']}")
+    if result.get("child_session_id"):
+        lines.append(f"Child session: {result['child_session_id']}")
+    if result.get("files_written"):
+        lines.append("Files written: " + ", ".join(result["files_written"]))
+    worktree = result.get("worktree")
+    if isinstance(worktree, dict) and worktree.get("path"):
+        lines.append(f"Worktree: {worktree['path']}" + (f" (branch: {worktree['branch']})" if worktree.get("branch") else ""))
     return lines
 
 
@@ -313,6 +330,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
+    lines += _timeout_evidence_lines(evt)
     return "\n".join(lines)
 
 

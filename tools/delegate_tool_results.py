@@ -7,6 +7,7 @@ import json
 import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
+from agent.redact import REDACTION_UNAVAILABLE
 from tools.delegation_redaction import (
     parent_copy, redact_child_result, redact_child_text, redact_child_value, redact_summary,
 )
@@ -50,7 +51,9 @@ def _looks_like_error_output(content: Any) -> bool:
     first = content.splitlines()[0].strip().lower() if content.splitlines() else ""
     return first.startswith(("error:", "failed:", "traceback ", "exception:"))
 
-def _extract_output_tail(result: dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000) -> list[dict[str, Any]]:
+def _extract_output_tail(
+    result: dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000, fail_closed: bool = False,
+) -> list[dict[str, Any]]:
     """Last N tool-call results ``{tool, preview, is_error}`` from a child's conversation (the overlay's "Output"
     section), chronological order. Content blocks are flattened first so a block-wrapped "Error: ..." is still
     flagged; line structure is preserved (capped at ``max_chars``) so the overlay shows real output rather than a
@@ -70,9 +73,14 @@ def _extract_output_tail(result: dict[str, Any], *, max_entries: int = 12, max_c
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
         # Live progress (subagent.complete overlay): honours security.redact_secrets=false.
-        content = redact_child_text(_stringify_tool_content(msg.get("content") or ""), force=False)
-        tool_name = name_by_call_id.get(msg.get("tool_call_id") or "", "tool")
-        tail.append({"tool": tool_name, "preview": content[:max_chars], "is_error": _looks_like_error_output(content)})
+        content = redact_child_text(_stringify_tool_content(msg.get("content") or ""), force=fail_closed)
+        if fail_closed and content == REDACTION_UNAVAILABLE:
+            return []
+        tool_name = redact_child_text(name_by_call_id.get(msg.get("tool_call_id") or "", "tool"), force=fail_closed)
+        if fail_closed and tool_name == REDACTION_UNAVAILABLE:
+            return []
+        tail.append({"tool": tool_name[:128] if fail_closed else tool_name,
+                     "preview": content[:max_chars], "is_error": _looks_like_error_output(content)})
     tail.reverse()
     return tail
 

@@ -838,6 +838,23 @@ class _ChildRun:
         """Close steer acceptance (see ``_merge_late_steer``); returns late steer text, if any."""
         return _close_subagent_steering(self.subagent_id, self.child) if self.subagent_id else None
 
+    def timeout_evidence(self, entry: dict[str, Any]) -> None:
+        """Only completed tool rows, force-redacted before cutting; references survive without a tail."""
+        with _quiet("timeout tool evidence unavailable: %s", exc_info=True):
+            messages = getattr(self.child, "_session_messages", None)
+            if isinstance(messages, list):
+                tail = _extract_output_tail({"messages": list(messages)}, max_entries=8, max_chars=600,
+                                            fail_closed=True)
+                if tail:
+                    entry["partial_output_tail"] = tail
+        session_id = getattr(self.child, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            entry["child_session_id"] = session_id
+        with _quiet("timeout file references unavailable: %s", exc_info=True):
+            written = file_state.writes_by(self.child_task_id, self.wall_start)
+            if written:
+                entry["files_written"] = written[:40]
+
     def wait_liveness_aware(self, settled: threading.Event, child_future: Any, child_timeout: Optional[float]) -> None:
         """Wait for the worker or the stale verdict, where ``child_timeout`` bounds INACTIVITY, not total runtime.
 
@@ -1014,6 +1031,8 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        if is_timeout:
+            self.timeout_evidence(_error_entry)
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
         if close_deferred:

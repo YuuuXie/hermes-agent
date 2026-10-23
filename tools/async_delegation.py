@@ -1014,7 +1014,9 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
     else:
         payload = {
             "summary": result.get("summary"), "error": result.get("error"), "api_calls": result.get("api_calls", 0),
-            "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2))}
+            "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
+            **{key: result[key] for key in ("partial_output_tail", "child_session_id", "files_written", "worktree")
+               if key in result}}
     evt = {
         "type": "async_delegation", "delegation_id": record.get("delegation_id"),
         # session_key routes back to the originating gateway session; "" => CLI.
