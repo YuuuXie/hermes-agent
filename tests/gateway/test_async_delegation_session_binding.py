@@ -98,7 +98,7 @@ class TestGatewayPinningFailsClosed:
 
 
     @pytest.mark.asyncio
-    async def test_live_spawning_session_rebinds_from_different_route(self):
+    async def test_live_spawning_session_cannot_rebind_from_different_route(self):
         current = self._entry("sess_current")
         pinned = self._entry("sess_live")
         runner = self._make_runner(
@@ -106,14 +106,10 @@ class TestGatewayPinningFailsClosed:
             switched_entry=pinned,
         )
 
-        resolved = await runner._resolve_async_delegation_session(
-            current, "sess_live"
-        )
+        resolved = await runner._resolve_async_delegation_session(current, "sess_live")
 
-        assert resolved is pinned
-        runner.session_store.switch_session.assert_called_once_with(
-            current.session_key, "sess_live", expected_session_id=current.session_id,
-        )
+        assert resolved is None
+        self._assert_no_route_change(runner)
 
     @pytest.mark.asyncio
     async def test_non_compression_ended_parent_drops(self):
@@ -235,11 +231,10 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
     runner._session_db = SimpleNamespace(get_session=AsyncMock(side_effect=get_session))
     task = asyncio.create_task(runner._resolve_async_delegation_session(entry, "test-pinned"))
     await asyncio.wait_for(entered.wait(), 3)
-    expected = "test-pinned"
+    expected = entry.session_id
     if boundary != "none":
         runner._invalidate_session_run_generation(entry.session_key, reason="test boundary")
         assert not runner._is_session_run_current(entry.session_key, generation)
-        expected = entry.session_id
     if boundary == "replace":
         store.switch_session(entry.session_key, "test-replacement")
         expected = "test-replacement"
@@ -247,10 +242,7 @@ async def test_pending_pin_respects_concurrent_boundary(tmp_path, boundary):
     result = await asyncio.wait_for(task, 3)
 
     assert store.lookup_by_session_key(entry.session_key).session_id == expected
-    if boundary == "none":
-        assert result is not None and result.session_id == expected
-    else:
-        assert result is None
+    assert result is None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["readiness", "claimed"])
@@ -479,7 +471,7 @@ async def test_delegate_completion_preserves_real_route_ownership(
         route_before = current.session_id
         rejected = case in {
             "over_limit", "missing", "cycle", "malformed", "nonobject", "invalid_marker",
-            "empty_marker", "null_marker", "markerless", "null_config", "absent_config",
+            "empty_marker", "null_marker", "markerless", "null_config", "absent_config", "generic_parent",
             "current_boundary", "parent_boundary", "child_boundary", "intermediate_boundary", "compression_foreign",
         }
         resolved = []
@@ -512,7 +504,7 @@ async def test_delegate_completion_preserves_real_route_ownership(
             row = ad.get_durable_delegation(event["delegation_id"])
             assert row is not None
             assert row["delivery_state"] == ("dropped" if rejected else "delivered")
-        expected = "continuation" if case == "compression" else pinned if case == "generic_parent" else route_before
+        expected = "continuation" if case == "compression" else route_before
         assert resolved == ([] if rejected else [expected])
         current = store.lookup_by_session_key(entry.session_key)
         assert current is not None
@@ -526,3 +518,40 @@ async def test_delegate_completion_preserves_real_route_ownership(
                 after = db.get_session(sid)
                 for field in ("ended_at", "end_reason", "source", "session_key", "model_config"):
                     assert after[field] == row[field], (case, sid, field)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pin_kind", ["foreign_live", "relabeled_worker", "relabeled_markerless"])
+async def test_internal_completion_cannot_claim_human_route(tmp_path, pin_kind, request):
+    from gateway.config import GatewayConfig, Platform
+    from gateway.run import GatewayRunner, _profile_runtime_scope
+    from gateway.session import SessionSource
+
+    with _profile_runtime_scope(tmp_path):
+        runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+        store = runner.session_store
+        request.addfinalizer(runner.close_all_session_db_handles)
+        request.addfinalizer(store.close_all_db_handles)
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="owner-chat", chat_type="dm")
+        current = store.get_or_create_session(source)
+        human, key = current.session_id, current.session_key
+        db = store._db
+        if pin_kind == "foreign_live":
+            db.create_session("foreign", source="telegram")
+        else:
+            db.create_session("foreign", source="subagent", parent_session_id=human,
+                              model_config={"_delegate_from": human} if pin_kind == "relabeled_worker" else {})
+            db.record_gateway_session_peer("foreign", source="telegram", session_key=key,
+                                           chat_id=source.chat_id, chat_type="dm")
+        before = db.get_session(human)
+        if pin_kind == "relabeled_markerless":
+            worker = db.get_session("foreign")
+            assert worker["created_source"] == "subagent"
+            assert (await runner._lookup_completion_owner("foreign"))[0] == "terminal"
+        expected = "deliver" if pin_kind == "relabeled_worker" else "terminal"
+        assert await runner._classify_completion_target("foreign", key) == expected
+        resolved = await runner._resolve_async_delegation_session(current, "foreign")
+        assert (resolved.session_id if resolved else None) == (human if pin_kind == "relabeled_worker" else None)
+        assert store.peek_session_id(key) == human
+        assert db.get_session(human)["ended_at"] == before["ended_at"]
+        assert db.get_session(human)["end_reason"] == before["end_reason"]
