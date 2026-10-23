@@ -65,6 +65,22 @@ def _safe_copy_db(src: Path, dst: Path, *, timeout_seconds: float = 10.0) -> boo
             else:
                 busy_deadline = now + max(0.0, timeout_seconds)
 
+        # Hold one read generation across incremental backup steps. Without this,
+        # each concurrent WAL commit restarts the copy from page one.
+        conn.execute("BEGIN")
+        while True:
+            try:
+                conn.execute("SELECT count(*) FROM sqlite_schema").fetchone()
+                break
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if code is None or code & 0xff not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                remaining = busy_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _SQLiteBackupTimeout(
+                        f"database remained locked for {timeout_seconds:g} seconds") from exc
+                time.sleep(min(0.05, remaining))
         conn.backup(backup_conn, pages=256, progress=_check_backup_progress, sleep=0.1)
         return True
     except Exception as exc:

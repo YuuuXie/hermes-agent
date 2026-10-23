@@ -506,12 +506,7 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: list[tuple[Path, Path]], out_path: Path,
     *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
-    """Add every ``(abs_path, rel_path)`` to *zf*, WAL-safe for ``*.db``; return bytes archived.
-
-    ``on_db_failure(rel_path)`` runs when a SQLite snapshot fails (may raise to abort);
-    ``on_error(rel_path, exc)`` records a read failure; ``on_progress(i)`` fires every 500 files;
-    ``track_bytes`` stats plain files for the size total.
-    """
+    """Write entries WAL-safely; abort on DB errors, salvage plain-file errors."""
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
         try:
@@ -526,7 +521,11 @@ def _write_zip_entries(
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
         except (PermissionError, OSError, ValueError) as exc:
-            on_error(rel_path, exc)
+            if abs_path.suffix == ".db":
+                logger.warning("SQLite archive entry failed for %s: %s", rel_path, exc)
+                on_db_failure(rel_path)
+            else:
+                on_error(rel_path, exc)
             continue
         if i % 500 == 0:
             on_progress(i)
@@ -588,13 +587,7 @@ def _collect_external_entries() -> tuple[list[tuple[Path, str]], list[str]]:
 
 
 def run_backup(args) -> bool:
-    """Create a zip backup of the Hermes home directory.
-
-    True when every selected file landed in the archive (or there was nothing to back up); False
-    when the zip was written but is incomplete — it is kept so the rest can still be restored, and
-    the caller turns False into exit status 1 so a cron/systemd timer never publishes a "successful"
-    archive that is missing state.db. Hard failures keep raising ``SystemExit``.
-    """
+    """Return False for incomplete non-DB salvage; DB failure aborts publication."""
     hermes_root = get_default_hermes_root()
 
     if not hermes_root.is_dir():
@@ -635,11 +628,15 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         print(f"  {i}/{file_count} files ...")
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
+    def _db_failure(rel: Path) -> None:
+        print(f"Backup failed: {rel}: SQLite archive entry failed; previous archive was not replaced.")
+        raise SystemExit(1)
+
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
-            on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
+            on_db_failure=_db_failure,
             on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
         # External memory-provider state never includes ``.db`` files in practice, so no
         # SQLite snapshot is needed; _write_zip_file still drops a failed partial member.
