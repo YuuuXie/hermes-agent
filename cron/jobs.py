@@ -1761,7 +1761,27 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "session_mode": lambda value: _clear_retired_session_mode(value),
 }
+
+
+RETIRED_SESSION_MODE_ERROR = (
+    "This cron job requests a retired session_mode (cron-owned reuse). It will not run "
+    "as a fresh-session job automatically. Explicitly clear session_mode by updating it "
+    "to 'fresh' or null, then resume the job."
+)
+
+
+def job_has_retired_session_mode(job: dict[str, Any]) -> bool:
+    value = job.get("session_mode")
+    return value is not None and str(value).strip().lower() not in {"", "fresh", "new", "isolated"}
+
+
+def _clear_retired_session_mode(value: Any) -> None:
+    if value is not None and value is not False and str(value).strip().lower() not in {
+        "", "fresh", "new", "isolated"
+    }:
+        raise ValueError(RETIRED_SESSION_MODE_ERROR)
 
 
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
@@ -2096,6 +2116,8 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
+        if "session_mode" in updates:
+            updated.pop("session_mode", None)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
             _validate_job_mode_invariants(

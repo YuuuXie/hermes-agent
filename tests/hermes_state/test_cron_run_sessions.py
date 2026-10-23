@@ -111,6 +111,30 @@ def test_legacy_runs_of_a_job_whose_id_extends_another_stay_with_their_own_job(t
     assert [(r['id'], r['cron_job_id']) for r in daily] == [('cron_daily_20261011_120000', 'daily')]
     assert [(r['id'], r['cron_job_id']) for r in digest] == [('cron_daily_digest_20261011_130000', 'daily_digest')]
 
+def test_retired_reused_root_and_rotated_tip_remain_readable(tmp_path):
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.create_session('cron_daily', source='cron')
+        db.end_session('cron_daily', 'compression')
+        db.create_session('continuation-daily', source='cron', parent_session_id='cron_daily')
+        db.create_session('cron_daily_20261011_120000', source='cron')
+        db.create_session('cron_daily_digest', source='cron')
+
+        rows = db.list_cron_job_runs('daily')
+        ids = [row['id'] for row in rows]
+        assert 'continuation-daily' in ids
+        assert 'cron_daily_digest' not in ids
+        assert 'cron_daily_20261011_120000' in ids
+        assert [row['cron_execution_id'] for row in rows if row['id'] == 'continuation-daily'] == [None]
+        assert db.list_cron_job_runs('daily', limit=1, offset=0)[0]['id'] == ids[0]
+        assert db.list_cron_job_runs('daily', limit=1, offset=1)[0]['id'] == ids[1]
+
+def test_unrotated_reused_root_is_listed_only_for_its_exact_job(tmp_path):
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.create_session('cron_daily', source='cron')
+        db.create_session('cron_daily_digest', source='cron')
+        assert [row['id'] for row in db.list_cron_job_runs('daily')] == ['cron_daily']
+        assert [row['id'] for row in db.list_cron_job_runs('daily_digest')] == ['cron_daily_digest']
+
 
 def test_run_lookup_is_index_served_on_new_and_upgraded_stores(tmp_path, monkeypatch):
     """A job's unified runs come from an index range bounded by that job's runs, not from a scan

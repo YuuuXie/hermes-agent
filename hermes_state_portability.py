@@ -256,18 +256,22 @@ class SessionPortabilityMixin:
         Both scans scale with this job's runs, never with total cron history or with every local
         session's policy receipt, and skip ``list_sessions_rich``'s compression-chain CTE.
 
-        Limitation (legacy runs had it too): only a run's FIRST session is listed. A run that
-        compressed continues in a child session this does not return, and the row's liveness
-        (``scheduler_owned``) and detail identity follow that first session, not the tip."""
+        Archived cron-owned reuse is read-only: include its exact ``cron_<job>`` root or
+        compression tip without reviving reuse for execution. Fresh runs still list their
+        first session only; their compression children are not independently listed."""
         prefix, prefix_hi = prefix_range(f"cron_{job_id}_")
         request_lo, request_hi = cron_request_range(job_id)
+        stable_root = f"cron_{job_id}"
+        stable_tip = self.get_compression_tip(stable_root) or stable_root
         query = _rich_select(
-            f"s.*, {_CRON_EXECUTION_SQL} AS cron_execution_id", f"s.source = 'cron' AND s.id IN ({_CRON_RUN_IDS_SQL})",
+            f"s.*, {_CRON_EXECUTION_SQL} AS cron_execution_id",
+            f"s.source = 'cron' AND (s.id = :stable_tip OR s.id IN ({_CRON_RUN_IDS_SQL}))",
             "\n            ORDER BY s.started_at DESC, s.id DESC\n            LIMIT :limit OFFSET :offset",
             prompt_select=f",\n                {_PROMPT_RESOLVED_SQL}",
         )
         rows = self._read_rows(query, {"prefix": prefix, "prefix_hi": prefix_hi, "request_lo": request_lo,
-                                       "request_hi": request_hi, "job_id": job_id, "limit": limit, "offset": offset})
+                                       "request_hi": request_hi, "job_id": job_id, "stable_tip": stable_tip,
+                                       "limit": limit, "offset": offset})
         return [{**self._rich_row(row), "cron_job_id": job_id} for row in rows]
 
     def cron_run_identity(self, session_id: str) -> Optional[dict[str, Any]]:
