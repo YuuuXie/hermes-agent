@@ -79,7 +79,7 @@ class ChronosCronScheduler(CronScheduler):
         self._ticker_kwargs = {"adapters": adapters, "loop": loop, "interval": interval}
         self._stop_event = stop_event
         # A new lifecycle can't prove what an interrupted process did: classify unknown, never requeue.
-        self.recover_interrupted()
+        self.recover_interrupted(adapters=adapters, loop=loop)
         self._reconcile_logged(logger.warning, "start()")
 
     def stop(self) -> None:
