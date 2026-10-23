@@ -1112,7 +1112,6 @@ class _ChildRun:
         release credential lease → restore the parent's process-global tool names → detach from the parent's
         interrupt list → close the child (unless a timed-out worker still owns it) → pop the child's Relay scope if
         no turn is active."""
-        child = self.child
         heartbeat.stop()
         pending = self.pending_future
         if pending is not None and not pending.done():
