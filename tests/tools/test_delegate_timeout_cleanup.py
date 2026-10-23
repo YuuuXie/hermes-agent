@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import threading
 from types import SimpleNamespace
+from typing import Any, cast
 
 from tools import delegate_tool
+from tools import delegate_tool_child_run as child_run
 
 
 class _SlowUnwindingChild:
@@ -17,6 +19,7 @@ class _SlowUnwindingChild:
         self._delegate_depth = 1
         self._subagent_id = None
         self.model = "test-model"
+        self.session_id = "held-child"
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
         self.session_estimated_cost_usd = 0.0
@@ -101,3 +104,60 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     assert not child.close_while_running, (
         "timed-out child.close() raced its still-running conversation thread"
     )
+
+
+def test_live_worker_retains_ownership_until_future_settles(monkeypatch):
+    from tests.waiting import wait_until
+    from tools import subagent_worktree
+
+    child = _SlowUnwindingChild()
+
+    parent = SimpleNamespace(session_id="owner", _current_task_id=None,
+                             _active_children=[child], _active_children_lock=threading.Lock())
+    class Pool:
+        def __init__(self):
+            self.released = []
+        def release_lease(self, credential):
+            self.released.append(credential)
+    pool = Pool()
+    finalized = []
+    monkeypatch.setattr(delegate_tool, "_lease_child_credential", lambda _child: (pool, "lease"))
+    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(child_run, "_create_isolated_worktree", lambda *_: {"path": "/tmp/preserved", "branch": "test"})
+    monkeypatch.setattr(subagent_worktree, "build_worktree_context_note", lambda _: "")
+    monkeypatch.setattr(subagent_worktree, "finalize_subagent_worktree", lambda info: finalized.append(info))
+    monkeypatch.setattr(subagent_worktree, "unproven_worktree_payload", lambda info, reason: {**info, "reason": reason})
+
+    result = delegate_tool._run_single_child(0, "held worker", child, parent)
+    assert result["status"] == "timeout"
+    assert result["worktree"]["path"] == "/tmp/preserved"
+    assert "still running" in result["worktree"]["reason"]
+    assert child.unwinding.wait(timeout=10)
+    try:
+        assert pool.released == [] and finalized == []
+        assert child in parent._active_children
+        assert not child.closed.is_set()
+    finally:
+        child.allow_finish.set()
+    assert wait_until(lambda: child.closed.is_set() and pool.released == ["lease"] and child not in parent._active_children,
+                      timeout=10)
+
+    assert finalized == []
+
+
+def test_parent_close_preserves_live_delegated_worker():
+    from concurrent.futures import Future
+    from run_agent import AIAgent
+
+    child = _SlowUnwindingChild()
+    future = Future()
+    setattr(child, "_delegate_worker_future", future)
+    parent = SimpleNamespace(_active_children=[child], _active_children_lock=threading.Lock())
+    AIAgent._close_active_children(cast(Any, parent), soft=False)
+    assert parent._active_children == [child]
+    assert not child.closed.is_set()
+    # done() alone does not mean cleanup callbacks have run; delegation still owns close.
+    future.set_result(None)
+    AIAgent._close_active_children(cast(Any, parent), soft=False)
+    assert parent._active_children == [child]
+    assert not child.closed.is_set()
