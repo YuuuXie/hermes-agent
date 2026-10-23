@@ -196,6 +196,14 @@ class FileStateRegistry:
         with self._state_lock:
             return list(self._reads.get(task_id, {}).keys())
 
+    def writes_by(self, task_id: str, since_ts: float) -> list[str]:
+        """Resolved paths last written by this task, without scanning a live worktree."""
+        if _disabled():
+            return []
+        with self._state_lock:
+            return sorted(p for p, (writer, ts) in self._last_writer.items()
+                          if writer == task_id and ts >= since_ts)
+
     def forget_task(self, task_id: str) -> None:
         """Release read stamps and writer claims owned by a task after its lifecycle ends.
 
@@ -248,12 +256,16 @@ def writes_since(exclude_task_id: str, since_ts: float, paths: Iterable[str | Pa
 def known_reads(task_id: str) -> list[str]:
     return _registry.known_reads(task_id)
 
+def writes_by(task_id: str, since_ts: float) -> list[str]:
+    return _registry.writes_by(task_id, since_ts)
+
 
 __all__ = [
     "FileStateRegistry",
     "check_stale",
     "get_registry",
     "known_reads",
+    "writes_by",
     "lock_path",
     "note_write",
     "record_read",
