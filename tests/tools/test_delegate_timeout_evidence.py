@@ -3,6 +3,7 @@
 import queue
 import threading
 from types import SimpleNamespace
+from typing import Any, cast
 
 from tools import async_delegation, delegate_tool, delegate_tool_child_run, delegate_tool_results
 from tools import process_registry, process_registry_notifications
@@ -13,7 +14,7 @@ def test_timeout_run_returns_completed_tool_evidence_without_summary(monkeypatch
 
     child = _SlowUnwindingChild()
     child.session_id = "saved-child-session"
-    setattr(child, "_session_messages", [{"role": "tool", "content": "finished check"}])
+    cast(Any, child)._session_messages = [{"role": "tool", "content": "finished check"}]
     parent = SimpleNamespace(session_id="parent", _current_task_id=None,
                              _active_children=[child], _active_children_lock=threading.Lock())
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
