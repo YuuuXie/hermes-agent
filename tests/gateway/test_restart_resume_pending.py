@@ -269,7 +269,7 @@ class TestResumePendingSystemNote:
         'what next?', so the resumed turn must complete the interrupted work
         instead of acknowledging (#57056)."""
         note = build_resume_recovery_note("restart_timeout", "", interactive=False)
-        assert note != build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert note == build_resume_recovery_note("restart_timeout", "", interactive=True)
         assert "CONTINUE the interrupted task" in note
         assert "ask what they would like to do next" not in note
         # Must not tell the model to skip the unfinished work it should finish.

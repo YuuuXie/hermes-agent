@@ -1040,11 +1040,8 @@ def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
-
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    An empty synthetic turn continues interrupted work on every platform; a real new
+    instruction takes precedence. Already-recorded tool results must not be repeated.
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
@@ -1053,21 +1050,14 @@ def build_resume_recovery_note(
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+            "Do NOT re-execute completed tool calls. This recovery note does not supersede the "
+            "user's new instruction, including an explicit request to continue unfinished work. "
+            "Check recorded results first."
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion.")
+            "Do NOT emit a 'session restored' acknowledgement or ask questions. "
+            "Review the conversation history and CONTINUE the interrupted task to completion.")
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "
             "appear in the history — resume from the first step that has no recorded result.")
