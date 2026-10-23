@@ -4160,7 +4160,57 @@ def _release_tick_lock(lock_fd) -> None:
     lock_fd.close()
 
 
-def _maybe_reap_dead_owners() -> None:
+def _alert_reclaimed_execution(record: dict, *, adapters=None, loop=None) -> None:
+    """Notify only for a recovery whose ledger CAS actually moved to unknown."""
+    from cron.executions import record_execution_delivery_outcome
+    from cron.jobs import get_job
+
+    outcome = "failed"
+    try:
+        job = get_job(record["job_id"])
+        if job is None:
+            return
+        error = str(record.get("error") or "Cron execution owner exited before completion; effects are unknown.")
+        incident_acked, incident_id = _upsert_incident_for_failure(job, error)
+        if incident_acked:
+            outcome = "suppressed_acked"
+            return
+        normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
+        try:
+            delivery_error = _deliver_result(
+                job, _summarize_cron_failure_for_delivery(job, error),
+                adapters=adapters, loop=loop, for_failure=True)
+        except Exception as exc:
+            logger.error("Delivery failed for reclaimed cron execution %s: %s", record["id"], exc, exc_info=True)
+            delivery_error = str(exc)
+        outcome = _classify_delivery_outcome(
+            delivery_error=delivery_error,
+            delivery_queued=job.get("last_delivery_queued"),
+            should_deliver=True,
+            unresolved_origin=bool(not delivery_error and normalized_deliver == "origin"
+                                   and not _resolve_delivery_targets(job, for_failure=True)),
+            normalized_deliver=normalized_deliver,
+            incident_acked=False, success=False,
+        )
+        if outcome == "delivered":
+            _mark_incident_alerted(incident_id)
+    finally:
+        record_execution_delivery_outcome(record["id"], outcome)
+
+
+def _recover_interrupted_executions_with_alerts(*, adapters=None, loop=None) -> int:
+    from cron.executions import recover_interrupted_executions
+
+    recovered = recover_interrupted_executions()
+    for record in getattr(recovered, "records", ()):
+        try:
+            _alert_reclaimed_execution(record, adapters=adapters, loop=loop)
+        except Exception as exc:
+            logger.warning("Alert failed for reclaimed execution %s: %s", record.get("id"), exc, exc_info=True)
+    return int(recovered)
+
+
+def _maybe_reap_dead_owners(*, adapters=None, loop=None) -> None:
     """Dead-owner reclaim: a run that died mid-flight would leave its row 'claimed' forever. Rows
     whose owner process is proved gone are released (_owner_is_live), as are rows whose live owner
     holds a claim older than the derived stale bound (the process is not killed). Throttled."""
@@ -4180,9 +4230,7 @@ def _maybe_reap_dead_owners() -> None:
         return
     _last_dead_owner_reap_at[_reap_key] = _reap_now
     try:
-        from cron.executions import recover_interrupted_executions
-
-        _reclaimed = recover_interrupted_executions()
+        _reclaimed = _recover_interrupted_executions_with_alerts(adapters=adapters, loop=loop)
         if _reclaimed:
             logger.warning(
                 "Reclaimed %d cron execution(s) whose owner process died "

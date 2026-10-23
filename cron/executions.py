@@ -423,12 +423,34 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
                      job_id, execution_id, error, record_err)
 
 
-def recover_interrupted_executions() -> int:
+class RecoveredExecutions(int):
+    """Count-compatible recovery result carrying only CAS-transitioned records."""
+
+    def __new__(cls, records: list[dict[str, Any]]):
+        result = super().__new__(cls, len(records))
+        result.records = tuple(records)
+        return result
+
+
+def record_execution_delivery_outcome(execution_id: str, outcome: str) -> Optional[dict[str, Any]]:
+    """Persist notification outcome without changing the uncertain execution status."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET delivery_outcome=? WHERE id=? AND status='unknown'",
+            (outcome, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=outcome)
+    return record
+
+
+def recover_interrupted_executions() -> RecoveredExecutions:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
     process is not killed)."""
     now = _hermes_now().isoformat()
-    changed = 0
     recovered: list[dict[str, Any]] = []
     # Derived on the first live-owned row only: the bound reads config, and the idle gateway
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
@@ -487,16 +509,15 @@ def recover_interrupted_executions() -> int:
                  row["handoff_pending"], row["handoff_started_at"],
                  row["claimed_at"], row["progress_at"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
-        if changed:
+        if recovered:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
-    return changed
+    return RecoveredExecutions(recovered)
 
 
 def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
