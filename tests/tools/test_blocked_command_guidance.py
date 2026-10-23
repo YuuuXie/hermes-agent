@@ -72,3 +72,29 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+    def test_package_operations_name_binaries_without_launching_them(self):
+        for command in (
+            "npm install nodemon", "npm add nodemon --save-dev",
+            "pnpm add vite", "yarn add gunicorn", "bun install uvicorn",
+            "pip install uvicorn", "pip3 uninstall gunicorn",
+            "python3 -m pip download uvicorn", "python -m pip wheel gunicorn",
+            "pip hash uvicorn", "pip check uvicorn", "apt-get install gunicorn",
+            "conda install uvicorn", "brew install nodemon", "apk add uvicorn",
+        ):
+            assert _foreground_background_guidance(command) is None, command
+
+    def test_package_operation_does_not_hide_later_service(self):
+        for command in (
+            "npm install nodemon && npm start",
+            "pip install uvicorn; uvicorn app:app",
+            "pip check uvicorn || gunicorn app:app",
+            "npm add nodemon | nodemon app.js",
+            "pip wheel gunicorn\npython3 -m http.server",
+        ):
+            message = _foreground_background_guidance(command)
+            assert message is not None and "long-lived server" in message, command
+
+    def test_non_package_service_with_install_words_still_warns(self):
+        message = _foreground_background_guidance("uvicorn app:app --note pip install")
+        assert message is not None and "long-lived server" in message
