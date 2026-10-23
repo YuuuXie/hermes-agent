@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import pytest
 
+import cron.incidents as incidents_mod
 import cron.scheduler as scheduler_mod
 from hermes_constants import hermes_home_key
 
@@ -145,6 +146,87 @@ class TestTickReapsDeadOwnerClaims:
         )
 
         assert _run_tick() == 0
+
+
+class TestReclaimedExecutionAlerts:
+    def test_tick_persists_incident_and_failure_lane_outcome(self, monkeypatch, executions):
+        execution_id = _orphan_claimed_row(executions, "routed-job")
+        job = {"id": "routed-job", "name": "routed-job", "deliver": "slack:D0MAIN",
+               "failure_deliver": "slack:D0ALERTS"}
+        monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job)
+        deliveries = []
+
+        def deliver(_job, content, **kwargs):
+            deliveries.append((content, kwargs))
+
+        monkeypatch.setattr(scheduler_mod, "_deliver_result", deliver)
+        _run_tick()
+        _run_tick()  # neither the already-terminal record nor throttled scan sends twice
+
+        assert len(deliveries) == 1
+        assert deliveries[0][1]["for_failure"] is True
+        assert "unknown" in deliveries[0][0].lower()
+        assert incidents_mod.list_incidents()[0]["state"] == "alerted"
+        assert executions.get_execution(execution_id)["status"] == "unknown"
+        assert executions.get_execution(execution_id)["delivery_outcome"] == "delivered"
+
+    def test_local_failure_lane_records_suppressed_incident(self, monkeypatch, executions):
+        execution_id = _orphan_claimed_row(executions, "silent-job")
+        monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+            "id": job_id, "name": job_id, "deliver": "slack:D0MAIN", "failure_deliver": "local"})
+        _run_tick()
+        assert incidents_mod.list_incidents()[0]["state"] == "detected"
+        assert executions.get_execution(execution_id)["delivery_outcome"] == "suppressed"
+
+    def test_provider_startup_reclaim_notifies(self, monkeypatch, executions):
+        from cron.scheduler_provider import InProcessCronScheduler
+
+        execution_id = _orphan_claimed_row(executions, "startup-job")
+        monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+            "id": job_id, "name": job_id, "failure_deliver": "local"})
+        assert InProcessCronScheduler().recover_interrupted() == 1
+        assert incidents_mod.list_incidents()[0]["job_id"] == "startup-job"
+        assert executions.get_execution(execution_id)["delivery_outcome"] == "suppressed"
+
+    def test_manual_fire_reclaim_notifies(self, monkeypatch, executions):
+        from tools.cronjob_tools import _reap_stale_executions
+
+        execution_id = _orphan_claimed_row(executions, "manual-job")
+        monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+            "id": job_id, "name": job_id, "failure_deliver": "local"})
+        _reap_stale_executions("manual-job")
+        assert incidents_mod.list_incidents()[0]["job_id"] == "manual-job"
+        assert executions.get_execution(execution_id)["delivery_outcome"] == "suppressed"
+
+    def test_acknowledged_incident_does_not_redeliver(self, monkeypatch, executions):
+        execution_id = _orphan_claimed_row(executions, "acked-job")
+        monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+            "id": job_id, "name": job_id, "failure_deliver": "slack:D0ALERTS"})
+        incident_id, _ = incidents_mod.upsert_incident("acked-job", executions._OWNER_GONE_REASON)
+        assert incidents_mod.ack_incident(incident_id)
+        monkeypatch.setattr(scheduler_mod, "_deliver_result", lambda *_a, **_kw: pytest.fail("sent acked notice"))
+        _run_tick()
+        assert incidents_mod.get_incident(incident_id)["state"] == "closed"
+        assert executions.get_execution(execution_id)["delivery_outcome"] == "suppressed_acked"
+
+    def test_failed_notice_does_not_hide_other_reclaimed_records(self, monkeypatch, executions):
+        ids = {name: _orphan_claimed_row(executions, name) for name in ("broken", "healthy")}
+        monkeypatch.setattr("cron.jobs.get_job", lambda job_id: {
+            "id": job_id, "name": job_id, "failure_deliver": "slack:D0ALERTS"})
+        delivered = []
+
+        def deliver(job, _content, **kwargs):
+            assert kwargs["for_failure"] is True
+            if job["id"] == "broken":
+                raise RuntimeError("delivery unavailable")
+            delivered.append(job["id"])
+
+        monkeypatch.setattr(scheduler_mod, "_deliver_result", deliver)
+        _run_tick()
+        assert delivered == ["healthy"]
+        assert executions.get_execution(ids["broken"])["delivery_outcome"] == "failed"
+        assert executions.get_execution(ids["healthy"])["delivery_outcome"] == "delivered"
+        assert all(executions.get_execution(execution_id)["status"] == "unknown" for execution_id in ids.values())
 
 
 class TestOneShotCliRunIsSynchronous:
