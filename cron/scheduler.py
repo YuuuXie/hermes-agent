@@ -2267,6 +2267,11 @@ def _prepare_job_prompt(
             return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
+    from cron.jobs import RETIRED_SESSION_MODE_ERROR, job_has_retired_session_mode
+
+    if job_has_retired_session_mode(job):
+        return _block_and_pause_job(job_id, job_name, RETIRED_SESSION_MODE_ERROR), None
+
     if job.get("no_agent"):
         return _run_no_agent_job(job, job_id, job_name, cancel_event), None
 
