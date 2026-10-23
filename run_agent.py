@@ -970,8 +970,12 @@ class AIAgent(
         """Detach and close per-turn child agents; ``soft`` releases their clients first, falling back to close()."""
         try:
             with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
+                # Delegation's own finally/Future callback owns teardown, including the narrow
+                # window after the Future settles but before its callbacks have finished.
+                children = [child for child in self._active_children
+                            if getattr(child, "_delegate_worker_future", None) is None]
+                for child in children:
+                    self._active_children.remove(child)
         except Exception:
             return
         for child in children:
