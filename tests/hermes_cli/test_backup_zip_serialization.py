@@ -48,9 +48,13 @@ def test_zip_captures_live_wal_and_cleans_failed_staging(tmp_path, monkeypatch, 
         with zipfile.ZipFile(archive) as zipped:
             previous = {info.filename: info.CRC for info in zipped.infolist()}
         monkeypatch.setattr(zipfile.ZipFile, "write", refuse_write)
-        run()
-        assert sorted(output.iterdir()) == [archive], "a failed write must not leak a private database snapshot"
         if automatic:
-            with zipfile.ZipFile(archive) as zipped:
-                assert {info.filename: info.CRC for info in zipped.infolist()} == previous, \
-                    "an all-failed run must not overwrite the previous good archive"
+            assert run() is None
+        else:
+            with pytest.raises(SystemExit) as failure:
+                run()
+            assert failure.value.code != 0
+        assert sorted(output.iterdir()) == [archive], "a failed write must not leak a private database snapshot"
+        with zipfile.ZipFile(archive) as zipped:
+            assert {info.filename: info.CRC for info in zipped.infolist()} == previous, \
+                "a failed DB entry must not overwrite the previous good archive"
