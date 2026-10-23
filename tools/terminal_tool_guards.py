@@ -97,6 +97,29 @@ _LONG_LIVED_FOREGROUND_PATTERNS = tuple(re.compile(p, re.IGNORECASE) for p in (
     r"\bpython(?:3)?\s+-m\s+http\.server\b",
 ))
 
+# A package operation names dependencies but does not launch them. Scope the
+# exemption to one shell segment so a chained service still gets guidance.
+_PACKAGE_OPERATION_RE = re.compile(
+    r"^\s*(?:(?:pip3?|python3?\s+-m\s+pip|uv\s+pip)\s+"
+    r"(?:-\S+\s+)*(?:install|uninstall|download|wheel|hash|check)|"
+    r"(?:conda|apt(?:-get)?|apk|brew|npm|pnpm|yarn|bun|uv)\s+"
+    r"(?:-\S+\s+)*(?:install|add))\b",
+    re.IGNORECASE,
+)
+_SHELL_SEGMENT_RE = re.compile(r"&&|\|\||[;|\n]")
+
+
+def _has_long_lived_foreground_launch(command: str) -> bool:
+    for segment in _SHELL_SEGMENT_RE.split(command):
+        # Executable substitutions can launch a service inside an install.
+        if _PACKAGE_OPERATION_RE.match(segment) and not any(
+            marker in segment for marker in _EXECUTABLE_SUBSTITUTION_MARKERS
+        ):
+            continue
+        if any(pattern.search(segment) for pattern in _LONG_LIVED_FOREGROUND_PATTERNS):
+            return True
+    return False
+
 # Ordered (predicate on the unquoted command, guidance) — first hit wins.
 _FOREGROUND_GUIDANCE = (
     (
@@ -113,7 +136,7 @@ _FOREGROUND_GUIDANCE = (
         "for bounded jobs — then run health checks and tests in follow-up terminal calls.",
     ),
     (
-        lambda s: any(p.search(s) for p in _LONG_LIVED_FOREGROUND_PATTERNS),
+        _has_long_lived_foreground_launch,
         "This foreground command appears to start a long-lived server/watch process. "
         "Run it with background=true, verify readiness (health endpoint/log signal), "
         "then execute tests in a separate command.",
