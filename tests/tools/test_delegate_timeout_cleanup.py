@@ -151,7 +151,7 @@ def test_parent_close_preserves_live_delegated_worker():
 
     child = _SlowUnwindingChild()
     future = Future()
-    setattr(child, "_delegate_worker_future", future)
+    cast(Any, child)._delegate_worker_future = future
     parent = SimpleNamespace(_active_children=[child], _active_children_lock=threading.Lock())
     AIAgent._close_active_children(cast(Any, parent), soft=False)
     assert parent._active_children == [child]
