@@ -95,6 +95,16 @@ def test_single_profile_startup_sends_reclaim_over_live_relay(relay_notice, monk
     assert len(relay_notice.delivered) == 1
 
 
+def test_chronos_startup_sends_reclaim_over_live_relay(relay_notice, monkeypatch):
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    execution_id = _orphan(relay_notice.job["id"])
+    provider = ChronosCronScheduler()
+    monkeypatch.setattr(provider, "reconcile", lambda: None)
+    provider.start(threading.Event(), adapters=relay_notice.adapters, loop=relay_notice.loop)
+    _assert_once(execution_id, relay_notice)
+
+
 def test_multiplex_startup_uses_owning_profile_relay(relay_notice, monkeypatch, tmp_path):
     from hermes_constants import get_hermes_home
 
