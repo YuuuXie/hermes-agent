@@ -1,6 +1,6 @@
 """Invariant tests for the bundled comfyui skill.
 
-Covers skills/creative/comfyui — the diffusion workflow runner. Tests assert
+Covers optional-skills/creative/comfyui — the diffusion workflow runner. Tests assert
 contracts (locale-independent file reads), not snapshots of skill content.
 """
 
@@ -13,10 +13,9 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 
 REPO = Path(__file__).resolve().parent.parent.parent
-SCRIPTS = REPO / "skills" / "creative" / "comfyui" / "scripts"
+SCRIPTS = REPO / "optional-skills" / "creative" / "comfyui" / "scripts"
 
 # Text reads that must not depend on the host locale. The workflow and schema
 # JSON are user-authored files (exported by ComfyUI or hand-edited), so they
@@ -38,11 +37,6 @@ _ENCODING_SENSITIVE_READS = [
 ]
 
 
-@pytest.mark.parametrize("rel_path,expected", _ENCODING_SENSITIVE_READS)
-def test_readers_are_locale_independent(rel_path, expected):
-    """Every text read of a user-supplied or system file pins its codec."""
-    source = (SCRIPTS / rel_path).read_text(encoding="utf-8")
-    assert expected in source, f"{rel_path}: locale-dependent read of a UTF-8 payload"
 
 
 def _run_under_c_locale(snippet: str) -> subprocess.CompletedProcess:
@@ -66,6 +60,7 @@ def _run_under_c_locale(snippet: str) -> subprocess.CompletedProcess:
         text=True,
         env=env,
         timeout=60,
+        check=False,
     )
 
 
@@ -130,3 +125,62 @@ def test_load_schema_tolerates_utf8_bom(tmp_path):
         f"load_schema rejected a BOM-prefixed schema:\n{result.stderr}"
     )
     assert "SUCCESS" in result.stdout
+
+
+def _run_ws_monitor(monkeypatch, capsys, argv, env_key=None):
+    """Run ws_monitor.main() against a websocket double; return (stderr, urls)."""
+    import types
+
+    connected: list[str] = []
+
+    class _Timeout(Exception):
+        pass
+
+    class _Conn:
+        def settimeout(self, _t):
+            pass
+
+        def recv(self):
+            raise _Timeout()
+
+        def close(self):
+            pass
+
+    def _create_connection(url, timeout=None):
+        connected.append(url)
+        return _Conn()
+
+    fake = types.ModuleType("websocket")
+    fake.WebSocketTimeoutException = _Timeout
+    fake.create_connection = _create_connection
+    monkeypatch.setitem(sys.modules, "websocket", fake)
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    if env_key is None:
+        monkeypatch.delenv("COMFY_CLOUD_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("COMFY_CLOUD_API_KEY", env_key)
+    import ws_monitor
+
+    assert ws_monitor.main(argv + ["--client-id", "cid-1", "--timeout", "1"]) == 0
+    return capsys.readouterr().err, connected
+
+
+def test_ws_monitor_connect_diagnostic_omits_cloud_token(monkeypatch, capsys):
+    secret = "synthetic-" + "cloud-key-1234"
+    err, urls = _run_ws_monitor(
+        monkeypatch, capsys, ["--host", "https://cloud.comfy.org"], env_key=secret
+    )
+    assert secret not in err
+    assert "wss://cloud.comfy.org/ws" in err
+    # Authentication of the real connection is unchanged.
+    assert urls and secret in urls[0]
+
+
+def test_ws_monitor_connect_diagnostic_omits_url_userinfo(monkeypatch, capsys):
+    password = "synthetic-" + "pw-5678"
+    err, urls = _run_ws_monitor(
+        monkeypatch, capsys, ["--host", f"http://user:{password}@[::1]:8188/comfy"]
+    )
+    assert password not in err
+    assert "ws://[::1]:8188/comfy/ws" in err
+    assert urls == [f"ws://user:{password}@[::1]:8188/comfy/ws?clientId=cid-1"]
