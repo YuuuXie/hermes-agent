@@ -100,3 +100,7 @@ class TestBackgroundGuidanceRecipes:
     def test_non_package_service_with_install_words_still_warns(self):
         message = _foreground_background_guidance("uvicorn app:app --note pip install")
         assert message is not None and "long-lived server" in message
+
+    def test_pip_maintenance_does_not_exempt_package_manager_scripts(self):
+        assert _foreground_background_guidance("npm check uvicorn") is not None
+        assert _foreground_background_guidance("pnpm check gunicorn") is not None

@@ -146,6 +146,7 @@ _PACKAGE_DATA_SUBCOMMANDS = frozenset((
     "install i add update up upgrade remove rm uninstall ls list view info show why outdated audit ci "
     "pkg search freeze download sync lock"
 ).split())
+_PIP_MAINTENANCE_SUBCOMMANDS = frozenset({"wheel", "hash", "check"})
 _VITE_LAUNCHERS = frozenset({"npx", "bunx", "pnpx", "npm", "pnpm", "yarn", "bun", "exec", "dlx", "x"})
 
 
@@ -257,7 +258,9 @@ def _is_data_command(word: str, args: list) -> bool:
     """True when *word* only reads, writes or lists what its arguments name."""
     if word == "command":
         return args[:1] in (["-v"], ["-V"])
+    pip_family = word in {"pip", "pip3"}
     if (word == "uv" and args[:1] == ["pip"]) or (_PYTHON_RE.match(word.rsplit("/", 1)[-1]) and args[:2] == ["-m", "pip"]):
+        pip_family = True
         args = args[args.index("pip") + 1:]
     elif word not in _PACKAGE_TOOLS:
         runs_or_follows = _DATA_COMMAND_EXCEPTIONS.get(word)
@@ -267,7 +270,9 @@ def _is_data_command(word: str, args: list) -> bool:
     i = 0
     while i < len(args) and args[i] in _PACKAGE_PLAIN_OPTIONS:
         i += 1
-    return "".join(args[i:i + 1]) in _PACKAGE_DATA_SUBCOMMANDS
+    subcommand = "".join(args[i:i + 1])
+    return subcommand in _PACKAGE_DATA_SUBCOMMANDS or (
+        pip_family and subcommand in _PIP_MAINTENANCE_SUBCOMMANDS)
 
 
 def _follows_logs(tokens: list) -> bool:
