@@ -769,6 +769,7 @@ def test_scratch_root_is_per_user(tmp_path: Path, monkeypatch) -> None:
 
     # Exercise the non-/var/tmp arm so the probe never mints roots in the real shared dir.
     # (Narrow: on 3.14 ``Path.is_dir()`` itself goes through ``os.path.isdir``.)
+    monkeypatch.delenv("TMPDIR", raising=False)
     monkeypatch.setattr(runner.tempfile, "gettempdir", lambda: str(tmp_path))
     real_isdir = os.path.isdir
     monkeypatch.setattr(runner.os.path, "isdir",

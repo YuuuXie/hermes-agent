@@ -286,6 +286,10 @@ contains pytest, the runner accepts the explicit `HERMES_PYTHON` above. It
 clears credentials, isolates `HERMES_HOME`, and runs each test file in a separate
 subprocess through `scripts/run_tests_parallel.py`. It does not use xdist.
 
+On POSIX, set `TMPDIR` to choose where the runner keeps its per-file scratch
+directories. Without an explicit selection it defaults to `/var/tmp` where
+available.
+
 Run the relevant JS workspace checks for JS changes. Native install/update
 E2E runs on disposable CI hosts, never against the developer's live app.
 See [Package management](website/docs/reference/package-management.md) for PM commands and runtime ownership.

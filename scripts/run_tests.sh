@@ -358,6 +358,13 @@ for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
   fi
 done
 
+# Forward a caller's scratch location, not the profile scratch exported by
+# Hermes itself when this command was launched from a Hermes session.
+SCRATCH_ENV=()
+if [ -n "${TMPDIR:-}" ] && [ "$TMPDIR" != "${HERMES_SCRATCH_DIR:-}" ]; then
+  SCRATCH_ENV+=("TMPDIR=$TMPDIR")
+fi
+
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
@@ -382,6 +389,7 @@ exec env -i \
   HOME="$HOME" \
   ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
+  ${SCRATCH_ENV[@]+"${SCRATCH_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
