@@ -130,6 +130,30 @@ class GatewayStartupMixin:
         until it finishes, else a user message can race it)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         try:
+            token = (event.metadata or {}).get("resume_interruption")
+            if token is not None:
+                entry = self.session_store.lookup_by_session_key(session_key)
+                current = (entry.session_id, entry.last_resume_marked_at or entry.updated_at) if entry else None
+                pending = bool(entry and entry.resume_pending and not entry.suspended)
+                queued = getattr(self, "_startup_restore_queue", ()) or ()
+                human_waiting = any(
+                    not item.internal and self._session_key_for_source(item.source) == session_key
+                    for item in queued
+                )
+                slot = getattr(adapter, "_pending_messages", None)
+                human_waiting = human_waiting or (
+                    isinstance(slot, dict) and session_key in slot and not slot[session_key].internal
+                )
+                state = self._peek_session_state(session_key)
+                if state:
+                    human_waiting = human_waiting or any(
+                        not item.internal for item in state.conversation.queued_events
+                    )
+                if (not pending or current != token or human_waiting
+                        or self._resume_interruption_claims.get(session_key) != token
+                        or not state or state.turn.agent is not _AGENT_PENDING_SENTINEL):
+                    logger.info("Skipping superseded startup resume for %s", session_key)
+                    return
             prime_revived_egress(adapter, event)
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})

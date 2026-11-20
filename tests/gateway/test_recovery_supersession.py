@@ -21,6 +21,7 @@ def _pending():
                          updated_at=now, origin=source, resume_pending=True,
                          resume_reason="restart_timeout", last_resume_marked_at=now)
     runner.session_store._entries = {key: entry}
+    runner.session_store.lookup_by_session_key = lambda lookup_key: runner.session_store._entries.get(lookup_key)
     adapter.handle_message = AsyncMock()
     return runner, adapter, entry
 
@@ -59,6 +60,34 @@ async def test_scheduled_wake_rechecks_interruption_before_dispatch(change):
     if change == "human":
         assert await runner._drain_startup_restore_queue() == 1
         assert adapter.handle_message.await_args.args[0] is human
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["new_marker", "adapter_human"])
+async def test_scheduled_wake_skips_new_interruption_or_adapter_queued_human(change):
+    runner, adapter, entry = _pending()
+    assert runner._schedule_resume_pending_sessions() == 1
+    if change == "new_marker":
+        entry.last_resume_marked_at += timedelta(seconds=1)
+    else:
+        human = MessageEvent(text="/stop", message_type=MessageType.COMMAND, source=entry.origin)
+        adapter._pending_messages[entry.session_key] = human
+    await asyncio.gather(*list(runner._background_tasks))
+    adapter.handle_message.assert_not_awaited()
+    assert not runner._is_session_running(entry.session_key)
+    if change == "adapter_human":
+        assert adapter._pending_messages[entry.session_key] is human
+
+
+@pytest.mark.asyncio
+async def test_scheduled_wake_does_not_release_a_replaced_pending_slot():
+    runner, adapter, entry = _pending()
+    assert runner._schedule_resume_pending_sessions() == 1
+    successor = object()
+    runner._session_state(entry.session_key).turn.agent = successor
+    await asyncio.gather(*list(runner._background_tasks))
+    adapter.handle_message.assert_not_awaited()
+    assert runner._session_state(entry.session_key).turn.agent is successor
 
 
 def test_interactive_resume_continues_but_new_instruction_wins():
