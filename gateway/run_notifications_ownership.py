@@ -150,8 +150,10 @@ class GatewayNotificationOwnershipMixin:
                     return "retry", session_id, None
             config = row.model_config
             if "_delegate_from" not in config:
-                verdict = "terminal" if row.source == "subagent" else "deliver"
-                return verdict, session_id, row
+                # source is mutable when a worker is attached to a gateway peer; creation
+                # provenance still identifies a markerless execution transcript.
+                worker = row.source == "subagent" or row.created_source == "subagent"
+                return ("terminal" if worker else "deliver"), session_id, row
             parent = config["_delegate_from"]
             if not isinstance(parent, str) or not parent.strip() or hops == _MAX_DELEGATE_PROVENANCE_HOPS:
                 return "terminal", session_id, None
