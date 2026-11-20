@@ -7,6 +7,8 @@ block: 66 minutes of a dead wave with nothing running.
 import queue
 from unittest.mock import patch
 
+import pytest
+
 from tools import async_delegation as ad
 from tools.process_registry_notifications import format_process_notification
 from tui_gateway.session_notifications import _notification_event_dedup_key
@@ -18,10 +20,17 @@ def _record(status="running"):
             "dispatched_at": 1.0, "role": "leaf", "model": "m", "context": None, "toolsets": None}
 
 
-def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_formats_as_early_warning():
+@pytest.mark.parametrize("pending", [False, True])
+def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_formats_as_early_warning(pending):
     q = queue.Queue()
-    entry = {"task_index": 1, "status": "error", "error": "401 authentication_error: key invalid", "duration_seconds": 12.5,
-             "live_transcript": "/tmp/live/task-1.log"}
+    entry = {"task_index": 1, "status": "timeout" if pending else "error",
+             "error": "child timed out" if pending else "401 authentication_error: key invalid",
+             "duration_seconds": 12.5, "live_transcript": "/tmp/live/task-1.log"}
+    if pending:
+        entry.update(worker_still_running=True, worker_state="quarantined",
+                     partial_output_tail=[{"tool": "terminal", "preview": "finished check"}],
+                     child_session_id="child-session", files_written=["/tmp/done.txt"],
+                     worktree={"path": "/tmp/tree", "branch": "feature"})
     with patch.object(ad, "_records", {"deleg_x": _record()}), \
          patch("tools.process_registry.process_registry") as reg:
         reg.completion_queue = q
@@ -30,10 +39,19 @@ def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_form
     evt = q.get_nowait()
     assert evt["type"] == "async_delegation" and evt["task_failure_notice"] is True
     assert (evt["session_key"], evt["origin_ui_session_id"], evt["parent_session_id"]) == ("sk", "ui", "root")
+    assert evt["results"][0].get("worker_still_running", False) is pending
     text = format_process_notification(evt)
-    assert text.startswith("[ASYNC DELEGATION TASK FAILED — deleg_x, task 2/3]")
-    assert "Task: b" in text and "401 authentication_error" in text and "/tmp/live/task-1.log" in text
+    assert text.startswith(f"[ASYNC DELEGATION TASK {'REPORTED' if pending else 'FAILED'} — deleg_x, task 2/3]")
+    assert "Task: b" in text and "/tmp/live/task-1.log" in text
     assert "consolidated results will still arrive" in text
+    if pending:
+        assert "do not re-dispatch overlapping work" in text
+        assert "finished check" in text and "child-session" in text
+        assert "/tmp/done.txt" in text and "/tmp/tree" in text
+        assert "re-dispatch or investigate now" not in text
+    else:
+        assert "401 authentication_error" in text
+        assert "re-dispatch or investigate now" in text
 
 
 def test_notice_is_not_sent_for_a_finished_batch_and_does_not_dedup_against_the_final_result():

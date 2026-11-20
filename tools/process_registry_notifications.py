@@ -255,14 +255,19 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     goals, idx, n = evt.get("goals") or [], r.get("task_index", 0), evt.get("n_tasks") or len(evt.get("goals") or [])
     goal = goals[idx] if idx < len(goals) else r.get("goal", "")
     err = str(r.get("error") or "").strip().replace("\n", " ")[:400]
+    pending = bool(r.get("worker_still_running"))
     lines = [
-        f"[ASYNC DELEGATION TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
-        "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
-        "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
-        "warning so you can re-dispatch or investigate now instead of then.",
+        f"[ASYNC DELEGATION TASK {'REPORTED' if pending else 'FAILED'} — {deleg_id}, task {idx + 1}/{n}]",
+        ("One subagent in a background fan-out reported a timeout while its worker was still running. "
+         "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
+         "warning: inspect the evidence now, but do not re-dispatch overlapping work until it settles." if pending else
+         "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
+         "The batch's consolidated results will still arrive when the last sibling finishes; this is an early "
+         "warning so you can re-dispatch or investigate now instead of then."),
         f"Task: {goal}" if goal else "",
         f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s" + (f"\nError: {err}" if err else ""),
     ]
+    lines += _worker_state_lines(r) + _timeout_evidence_lines(r)
     if r.get("live_transcript"):
         lines.append(f"Live transcript: {r['live_transcript']}")
     return "\n".join(line for line in lines if line)
