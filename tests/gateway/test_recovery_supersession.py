@@ -21,7 +21,6 @@ def _pending():
                          updated_at=now, origin=source, resume_pending=True,
                          resume_reason="restart_timeout", last_resume_marked_at=now)
     runner.session_store._entries = {key: entry}
-    runner.session_store.lookup_by_session_key = lambda lookup_key: runner.session_store._entries.get(lookup_key)
     adapter.handle_message = AsyncMock()
     return runner, adapter, entry
 

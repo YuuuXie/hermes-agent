@@ -158,6 +158,7 @@ def make_restart_runner(
     runner.pairing_store = MagicMock()
     runner.session_store = MagicMock()
     runner.session_store._entries = {}
+    runner.session_store.lookup_by_session_key.side_effect = lambda key: runner.session_store._entries.get(key)
     runner.delivery_router = MagicMock()
 
     platform_adapter = adapter or RestartTestAdapter()
