@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any, Callable, Optional
 
 from agent.delegation_context import owned_kanban_task
@@ -370,12 +370,10 @@ def _redact_opt(value: Any) -> Any:
     return _redact(value) if value else value
 
 
-def _redact_metadata(metadata: dict) -> Optional[dict]:
-    """Redact via a JSON round-trip; None if the result can't be re-parsed."""
-    try:
-        return json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
-    except json.JSONDecodeError:
-        return None
+def _redact_metadata(metadata: dict) -> dict:
+    """Redact leaf-by-leaf: a whole-JSON pass can eat a string's closing quote and fail to re-parse."""
+    from agent.redact_structured import redact_structured
+    return redact_structured(metadata)
 
 
 def _coerce_str_list(value: Any, name: str, what: str, *, strip: bool = False):
@@ -751,8 +749,7 @@ def _handle_complete(args: dict, **kw) -> str:
     result = _redact_opt(args.get("result"))
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
-        # Keep the unredacted dict if the redacted JSON cannot be re-parsed.
-        metadata = _redact_metadata(metadata) or metadata
+        metadata = _redact_metadata(metadata)
     created_cards = _coerce_str_list(
         args.get("created_cards"), "created_cards", "task ids", strip=True)
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
@@ -902,7 +899,6 @@ def _handle_request_review(args: dict, **kw) -> str:
     _require_dict_metadata(metadata)
     if metadata is not None:
         metadata = _redact_metadata(metadata)
-        _check(metadata is not None, "metadata could not be safely serialized")
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
@@ -1099,18 +1095,17 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
     """Return a session id only when it is present in this profile's state.db."""
     if not session_id:
         return None
-    try:
-        from hermes_state import SessionDB
-        from hermes_constants import get_hermes_home
+    with ExitStack() as handles:
+        try:
+            from hermes_constants import get_hermes_home
+            from persistence_assembly import open_persistence_reader
 
-        state = SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
-    except Exception:  # state.db may not exist for a CLI/dashboard invocation
-        logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
-        return None
-    try:
-        return session_id if state.get_session(session_id) else None
-    finally:
-        state.close()
+            state = handles.enter_context(open_persistence_reader(get_hermes_home()))
+            state.ready()
+        except Exception:  # state.db may not exist for a CLI/dashboard invocation
+            logger.debug("Could not open state.db to verify Kanban provenance", exc_info=True)
+            return None
+        return session_id if state.sessions.get(session_id) else None
 
 
 @_kanban_handler("kanban_create")
@@ -1183,22 +1178,22 @@ def _live_tui_session_key(session_key: str, profile: Optional[str]) -> str:
     the dead key silently drops every later completion notification (#110068). Maps the key
     to its continuation tip via the session store's lineage walk. Best-effort, fail-open:
     any error (or an unresolvable key) returns *session_key* unchanged."""
-    db_path = None
+    home = None
     if profile and profile != "default":
         try:
             from pathlib import Path
             from hermes_cli.profiles import get_profile_dir, profile_exists
             if profile_exists(profile):
-                db_path = Path(get_profile_dir(profile)) / "state.db"
+                home = Path(get_profile_dir(profile))
         except Exception:
-            db_path = None
+            home = None
     try:
-        from hermes_state_registry import acquire, release_or_close
-        db = acquire(db_path)
+        from persistence_assembly import open_persistence, profile_scope
+        persistence = open_persistence(profile_scope(home=home))
         try:
-            return db.resolve_resume_session_id(session_key) or session_key
+            return persistence.lineage.resolve_resume_target(session_key) or session_key
         finally:
-            release_or_close(db)
+            persistence.close()
     except Exception:
         return session_key
 
