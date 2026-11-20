@@ -5,7 +5,7 @@ Behaviour contracts, with the summariser stubbed at its model boundary:
 * flag off (the default) leaves the whole compression path as it was: no state, no pass, inline summary;
 * a pass never changes the live transcript or compressor, and runs under the caller's profile scope;
 * one pass per compaction: the candidate splices at its own boundary and every message after it, however
-  many, stays verbatim in the tail;
+  many, stays verbatim in the tail, wherever the fresh plan would cut;
 * in-place text rewrites (plugins, the no-LLM prune, blank-echo drop) keep the candidate; a changed message
   structure, a rewound transcript, a moved head or another session's transcript never splices;
 * without a completed candidate, compaction waits for a running pass whose window fits (forwarding its
@@ -29,6 +29,9 @@ from agent import prepared_compaction as pc
 from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor
 from agent.model_metadata import estimate_messages_tokens_rough
 from agent.prepared_compaction import PreparedCompaction
+from tests.fixtures.storage_read import conversation
+from tests.fixtures.storage_seed import seed_messages, seed_session
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 from tests.waiting import wait_until
 
 
@@ -265,6 +268,40 @@ def test_growth_past_the_candidate_beyond_the_tail_budget_still_splices_keeping_
     assert cc.prepared_compaction._entry is None
 
 
+@pytest.mark.parametrize("pass_state", ["completed", "running"])
+def test_a_fresh_cut_before_the_candidate_boundary_still_splices_and_the_boundary_starts_the_tail(pass_state):
+    """The fresh plan cutting earlier than the pass did (cheaper tail rows) never redoes the summary."""
+    cc = _compressor()
+    msgs = _messages(30)
+    if pass_state == "running":
+        cc.gate = threading.Event()
+        running = pc.maybe_prepare(_agent(cc), msgs, origin="test")
+        assert running is not None
+        pending = cc.prepared_compaction._pending
+        threading.Thread(target=lambda: wait_until(lambda: pending.on_progress is not None) and cc.gate.set()).start()
+    else:
+        _prepare(cc, msgs)
+    window = (cc.prepared_compaction._entry or cc.prepared_compaction._pending.window)
+    # The tail rows got cheaper since the pass planned (the no-LLM prune), so the fresh plan keeps more rows.
+    later = [m if i < window.compress_end else {**m, "content": m["content"][:8]} for i, m in enumerate(_grow(msgs, 2))]
+    _, _, start, end = cc._plan_compaction_window(later)
+    assert start == window.compress_start and end < window.compress_end
+
+    from agent.auxiliary_client import aux_progress_hook
+
+    with aux_progress_hook(lambda: None):
+        compressed = cc.compress(later, current_tokens=cc.threshold_tokens + 1)
+
+    if pass_state == "running":
+        running.join(5.0)
+    assert [c["worker"] for c in cc.calls] == [True], "one summary, written by the pass"
+    kept = later[window.compress_end:]
+    assert kept, "the pass planned its own tail"
+    for original, row in zip(kept, compressed[-len(kept):]):
+        assert original["content"] in row["content"]
+    assert cc.prepared_compaction._entry is None
+
+
 def test_in_place_text_rewrite_of_summarised_messages_keeps_the_candidate():
     """Plugins rewrite message text in place (redaction, pre-compaction notes): still the same messages."""
     cc = _compressor()
@@ -361,20 +398,18 @@ def test_prune_and_blank_echo_drop_do_not_invalidate_the_candidate():
 
 
 def test_identity_survives_a_session_db_round_trip_and_catches_a_rewind(tmp_path):
-    from hermes_state import SessionDB
-
     msgs = _messages(20)
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("S1", source="cli")
+    db = storage_handle(tmp_path)
+    seed_session(db, "S1", "cli")
     for m in msgs[1:]:
-        db.append_message("S1", role=m["role"], content=m["content"])
-    replayed = [msgs[0]] + db.get_messages_as_conversation("S1")
+        seed_messages(db, "S1", {"role": m["role"], "content": m["content"]})
+    replayed = [msgs[0]] + conversation(db, "S1")
     window = pc._Window("S1", 4, 15, pc.prefix_identities(replayed, 15))
-    assert pc._mismatch(window, msgs, "S1", 4, 15) is None, "the live dicts before their first persist"
-    assert pc._mismatch(window, replayed, "S1", 4, 15) is None
+    assert pc._mismatch(window, msgs, "S1", 4) is None, "the live dicts before their first persist"
+    assert pc._mismatch(window, replayed, "S1", 4) is None
     rewound = copy.deepcopy(replayed)
     rewound[6]["message_uid"] = "a-new-row"
-    assert "different message" in pc._mismatch(window, rewound, "S1", 4, 15)
+    assert "different message" in pc._mismatch(window, rewound, "S1", 4)
 
 
 # --------------------------------------------------------------------------- running passes
@@ -539,13 +574,12 @@ def test_a_held_candidate_starts_no_further_pass_however_far_the_prompt_grows(mo
 
 
 def test_failed_pass_backs_off_without_touching_live_failure_state(tmp_path, monkeypatch):
-    from hermes_state import SessionDB
     import agent.context_compressor as module
 
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("S1", source="cli")
+    db = storage_handle(tmp_path)
+    seed_session(db, "S1", "cli")
     cc = _compressor()
-    cc.bind_session_state(db, "S1")
+    cc.bind_session_state(db, "S1", persistence=db)
     msgs = _messages(30)
 
     monkeypatch.setattr(_StubCompressor, "_generate_summary", module.ContextCompressor._generate_summary)
@@ -557,7 +591,7 @@ def test_failed_pass_backs_off_without_touching_live_failure_state(tmp_path, mon
     assert call.call_count == 1
     assert cc.prepared_compaction._entry is None
     assert cc._summary_failure_cooldown_until == 0.0 and cc._last_summary_error is None
-    assert db.get_compression_failure_cooldown("S1") is None
+    assert db.messages.read_compression_cooldown("S1", time.time()) is None
     assert pc.maybe_prepare(_agent(cc), msgs, origin="test") is None, "backs off"
     assert call.call_count == 1
 

@@ -7,7 +7,7 @@ import json
 import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
-from agent.redact import REDACTION_UNAVAILABLE
+from tools import delegate_tool_config
 from tools.delegation_redaction import (
     parent_copy, redact_child_result, redact_child_text, redact_child_value, redact_summary,
 )
@@ -51,9 +51,7 @@ def _looks_like_error_output(content: Any) -> bool:
     first = content.splitlines()[0].strip().lower() if content.splitlines() else ""
     return first.startswith(("error:", "failed:", "traceback ", "exception:"))
 
-def _extract_output_tail(
-    result: dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000, fail_closed: bool = False,
-) -> list[dict[str, Any]]:
+def _extract_output_tail(result: dict[str, Any], *, max_entries: int = 12, max_chars: int = 8000) -> list[dict[str, Any]]:
     """Last N tool-call results ``{tool, preview, is_error}`` from a child's conversation (the overlay's "Output"
     section), chronological order. Content blocks are flattened first so a block-wrapped "Error: ..." is still
     flagged; line structure is preserved (capped at ``max_chars``) so the overlay shows real output rather than a
@@ -73,14 +71,9 @@ def _extract_output_tail(
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
         # Live progress (subagent.complete overlay): honours security.redact_secrets=false.
-        content = redact_child_text(_stringify_tool_content(msg.get("content") or ""), force=fail_closed)
-        if fail_closed and content == REDACTION_UNAVAILABLE:
-            return []
-        tool_name = redact_child_text(name_by_call_id.get(msg.get("tool_call_id") or "", "tool"), force=fail_closed)
-        if fail_closed and tool_name == REDACTION_UNAVAILABLE:
-            return []
-        tail.append({"tool": tool_name[:128] if fail_closed else tool_name,
-                     "preview": content[:max_chars], "is_error": _looks_like_error_output(content)})
+        content = redact_child_text(_stringify_tool_content(msg.get("content") or ""), force=False)
+        tool_name = name_by_call_id.get(msg.get("tool_call_id") or "", "tool")
+        tail.append({"tool": tool_name, "preview": content[:max_chars], "is_error": _looks_like_error_output(content)})
     tail.reverse()
     return tail
 
@@ -290,12 +283,11 @@ def _apply_summary_budget(results: list[dict[str, Any]], parent_agent) -> None:
     """Trim subagent summaries in-place so a batch can't overflow the parent's context window (full text spilled to
     disk). Per-summary cap = MIN(dynamic headroom budget, static ``delegation.max_summary_chars`` ceiling; 0 =
     disabled); over-cap summaries become head+tail plus a pointer to the spill file."""
-    from tools.delegate_tool import _load_config
     summaries = [r for r in results if isinstance(r, dict) and isinstance(r.get("summary"), str) and r["summary"]]
     if not summaries:
         return
     try:
-        static_ceiling = int(_load_config().get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
+        static_ceiling = int(delegate_tool_config._load_config().get("max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS))
     except (TypeError, ValueError):
         static_ceiling = DEFAULT_MAX_SUMMARY_CHARS
     candidates = [c for c in (static_ceiling, _parent_summary_char_budget(parent_agent, len(summaries))) if c and c > 0]
@@ -405,8 +397,11 @@ def _rollup_children_cost(parent_agent, children_cost_total: float) -> None:
     if children_cost_total <= 0.0:
         return
     try:
-        current = float(getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0)
-        parent_agent.session_estimated_cost_usd = current + children_cost_total
+        from agent.prompt_cache_lifecycle import session_totals_lock
+
+        with session_totals_lock(parent_agent):  # a keep-alive's reply adds to the same total under it
+            current = float(getattr(parent_agent, "session_estimated_cost_usd", 0.0) or 0.0)
+            parent_agent.session_estimated_cost_usd = current + children_cost_total
         if getattr(parent_agent, "session_cost_source", "none") in {None, "", "none"}:
             parent_agent.session_cost_source = "subagent"
         if getattr(parent_agent, "session_cost_status", "unknown") in {None, "", "unknown"}:
