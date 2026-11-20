@@ -1045,6 +1045,10 @@ def completion_event(record: dict[str, Any], result: dict[str, Any], status: str
         # A runner with no measured count (a cron run without a session) omits api_calls: never a fake 0.
         payload = {
             "summary": result.get("summary"), "error": result.get("error"),
+            **{key: result[key] for key in (
+                "worker_still_running", "worker_state", "partial_output_tail",
+                "child_session_id", "files_written", "worktree",
+            ) if key in result},
             **({"api_calls": result["api_calls"]} if result.get("api_calls") is not None else {}),
             "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2))}
     evt = {

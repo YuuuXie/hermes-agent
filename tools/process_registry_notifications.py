@@ -292,12 +292,16 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     n, n_unit = len(goals) or len(results), len(results) or len(goals)
     group = evt.get("group")
     unit = f"group '{group}' ({n_unit} subagent(s))" if group is not None else f"{n_unit} subagent(s)"
+    pending = any(r.get("worker_still_running") for r in results)
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-        f"A background fan-out unit you dispatched earlier — {unit} — has finished; its consolidated results are "
-        "below. Any other units from the same delegate_task call report separately as they finish. You may have "
-        "moved on since dispatching — act on these or re-dispatch if things have changed. If you are still waiting "
+        f"[ASYNC DELEGATION BATCH {'REPORTED' if pending else 'COMPLETE'} — {deleg_id}]",
+        f"A background fan-out unit you dispatched earlier — {unit} — has "
+        + ("reported its results below, but at least one timed-out worker was still running when reported; "
+           "do not re-dispatch its work until it settles. " if pending else
+           "finished; its consolidated results are below. ")
+        + "Any other units from the same delegate_task call report separately as they finish. "
+        "You may have moved on since dispatching. If you are still waiting "
         "on siblings, end your turn after acting on this one.",
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
@@ -332,10 +336,13 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         else:
             lines.append(f"(no summary — status={r_status}" + (f": {r_error}" if r_error else "") + ")")
         if r_status not in _DONE:
-            lines += _auto_resume_lines(r) or _failure_recovery_lines(r)
+            lines += _worker_state_lines(r)
+            if not r.get("worker_still_running"):
+                lines += _auto_resume_lines(r) or _failure_recovery_lines(r)
         if r.get("live_transcript"):
             lines.append(f"Full live transcript (complete tool/assistant trace): {r['live_transcript']}")
         lines += _process_accounting_lines(r)
+        lines += _timeout_evidence_lines(r)
     return "\n".join(lines)
 
 
@@ -374,6 +381,13 @@ def _timeout_evidence_lines(result: dict) -> list[str]:
     return lines
 
 
+def _worker_state_lines(result: dict) -> list[str]:
+    if not result.get("worker_still_running"):
+        return []
+    return ["The timed-out worker was still running when this result was reported (quarantined). "
+            "Its resources remain owned until it exits; do not assume completion or re-dispatch overlapping work."]
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
@@ -385,13 +399,16 @@ def _format_async_delegation(evt: dict) -> str:
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), evt.get("error")
+    pending = bool(evt.get("worker_still_running"))
     truncated = _is_truncated(evt)
     lines = _preamble(
         evt,
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        f"[ASYNC DELEGATION {'REPORTED' if pending else 'COMPLETE'} — {deleg_id}]",
+        ("A background subagent has reported a timeout while its worker was still running; "
+         "do not re-dispatch overlapping work until it settles." if pending else
+         "A background subagent you dispatched earlier has finished. You may "
+         "have moved on since dispatching it; the full task source is below so "
+         "you can act on the result or re-dispatch if things have changed."),
         completed_at, with_goal=True)
     lines += _notice_lines([evt]) + [
         f"Status: {status}" + (f"   API calls: {evt['api_calls']}" if evt.get("api_calls") is not None else "")
@@ -411,7 +428,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
-    lines += _timeout_evidence_lines(evt)
+    lines += _worker_state_lines(evt) + _timeout_evidence_lines(evt)
     return "\n".join(lines)
 
 
@@ -428,7 +445,7 @@ def async_delegation_display_text(evt: dict) -> str:
     for result in results:
         status = result.get("status") or ("failed" if result.get("error") else "completed")
         label = ("Incomplete" if _is_truncated(result) else "Completed") if status in _DONE else (
-            status_labels.get(status, "Incomplete"))
+            "Timed Out (Worker Running)" if result.get("worker_still_running") else status_labels.get(status, "Incomplete"))
         labels.append(label)
         index = result.get("task_index", 0)
         goal = goals[index] if 0 <= index < len(goals) else result.get("goal", "")

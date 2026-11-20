@@ -81,6 +81,53 @@ def _transfer_to_parent(rig, leg):
     ) is leg.proc
 
 
+@pytest.mark.asyncio
+async def test_explicit_handoff_pins_parent_after_child_closure_and_respects_parent_reset(
+    monkeypatch, tmp_path, request,
+):
+    import weakref
+
+    from gateway.run import _async_profile_runtime_scope
+    from gateway.session import SessionSource
+    from tools import delegate_tool_registry
+    from tools.process_registry import ProcessSession
+    from tools.process_registry_handoff import handoff_process
+
+    rig = _build_rig(monkeypatch, tmp_path, request, True, "all")
+    async with _async_profile_runtime_scope(rig.homes["a"]):
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", profile="a")
+        entry = rig.runner.session_store.get_or_create_session(source)
+        store = rig.runner.session_store._persistence_for_key(entry.session_key)
+        seed_session(store, "child-handoff", "subagent", model_config={"_delegate_from": entry.session_id})
+        process = ProcessSession(
+            id="process_handoff_test", command="NOT EXECUTED", owner_task_id="child-task",
+            task_id="child-task", session_key=entry.session_key, parent_session_id="child-handoff",
+            notify_on_complete=True, started_at=1.0,
+        )
+        rig.registry._running[process.id] = process
+
+        class Parent:
+            pass
+
+        parent = Parent()
+        parent.session_id = entry.session_id
+        parent._current_task_id = "parent-task"
+        child = SimpleNamespace(_delegate_parent_ref=weakref.ref(parent))
+        with delegate_tool_registry._active_subagents_lock:
+            delegate_tool_registry._active_subagents["child-task"] = {"agent": child}
+        try:
+            assert handoff_process(process.id, {"data": "finish build"}, "child-task")["status"] == "handed_off"
+            assert process.parent_session_id == entry.session_id
+            store.sessions.end("child-handoff", "session_reset")
+            assert await rig.runner._resolve_async_delegation_session(entry, process.parent_session_id) is not None
+            store.sessions.end(entry.session_id, "session_reset")
+            assert await rig.runner._resolve_async_delegation_session(entry, process.parent_session_id) is None
+        finally:
+            rig.registry._running.pop(process.id, None)
+            with delegate_tool_registry._active_subagents_lock:
+                delegate_tool_registry._active_subagents.pop("child-task", None)
+
+
 async def _for_each_leg(rig, owner, surface_a, path, consume):
     """Run ``consume`` on legs A, B, A; afterwards no route, row or pin may have moved."""
     from gateway.run import _async_profile_runtime_scope, _profile_runtime_scope

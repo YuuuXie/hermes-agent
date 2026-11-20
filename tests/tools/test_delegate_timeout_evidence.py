@@ -17,8 +17,8 @@ def test_timeout_run_returns_completed_tool_evidence_without_summary(monkeypatch
     cast(Any, child)._session_messages = [{"role": "tool", "content": "finished check"}]
     parent = SimpleNamespace(session_id="parent", _current_task_id=None,
                              _active_children=[child], _active_children_lock=threading.Lock())
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
-    monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
+    monkeypatch.setattr(delegate_tool_child_run, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(delegate_tool_child_run, "_get_worktree_isolation", lambda: False)
     try:
         result = delegate_tool._run_single_child(0, "pending", child, parent)
         assert result["status"] == "timeout" and result["summary"] is None
@@ -83,19 +83,24 @@ def test_single_and_batch_timeout_event_rendering(monkeypatch):
     events = queue.Queue()
     monkeypatch.setattr(process_registry.process_registry, "completion_queue", events)
     persisted = []
-    monkeypatch.setattr(async_delegation, "_persist_completion", lambda event, result: persisted.append((event, result)))
+    monkeypatch.setattr(async_delegation, "_persist_completion",
+                        lambda event, result, *, delivery: persisted.append((event, result, delivery)))
     entry = {"task_index": 0, "status": "timeout", "summary": None, "error": "inactive",
              "partial_output_tail": [{"tool": "terminal", "preview": "finished build", "is_error": False}],
              "child_session_id": "child-session", "files_written": ["/tmp/done.txt"],
+             "worker_still_running": True, "worker_state": "quarantined",
              "worktree": {"path": "/tmp/tree", "branch": "feature"}}
     record = {"delegation_id": "deleg-1", "goal": "build", "goals": ["build"],
               "parent_session_id": "parent", "session_key": "parent-key"}
     async_delegation._push_completion_event(record, entry, "timeout")
     event = events.get_nowait()
-    assert event["summary"] is None and event["partial_output_tail"] == entry["partial_output_tail"]
+    assert event["summary"] is None and event["worker_still_running"] is True
+    assert event["partial_output_tail"] == entry["partial_output_tail"]
     assert persisted[0][0]["child_session_id"] == "child-session"
     text = process_registry_notifications._format_async_delegation(event)
+    assert "still running" in text and "do not re-dispatch" in text
     assert "finished build" in text and "/tmp/done.txt" in text and "/tmp/tree" in text
+    assert "has finished" not in text
     assert "status=timeout" in text
 
     batch = {**record, "is_batch": True}
@@ -103,4 +108,28 @@ def test_single_and_batch_timeout_event_rendering(monkeypatch):
     batch_event = events.get_nowait()
     assert batch_event["results"][0]["summary"] is None
     batch_text = process_registry_notifications._format_async_delegation(batch_event)
+    assert "still running" in batch_text and "do not re-dispatch" in batch_text
     assert "finished build" in batch_text and "child-session" in batch_text
+    assert "has finished" not in batch_text
+
+
+def test_success_event_reports_only_child_writes_since_start(monkeypatch, tmp_path):
+    from tools import file_state
+
+    registry = file_state.FileStateRegistry()
+    monkeypatch.setattr(file_state, "_registry", registry)
+    monkeypatch.setattr(delegate_tool_child_run, "redact_child_result", lambda value, *args, **kwargs: value)
+    own = tmp_path / "own.txt"
+    sibling = tmp_path / "sibling.txt"
+    registry.note_write("child", str(own), mtime=1.0)
+    registry.note_write("sibling", str(sibling), mtime=1.0)
+    events = []
+    child = SimpleNamespace(session_prompt_tokens=0, session_completion_tokens=0,
+                            session_reasoning_tokens=0, session_estimated_cost_usd=None)
+    run = delegate_tool_child_run._ChildRun(
+        child, None, 0, "goal", None, lambda event, **payload: events.append((event, payload)),
+        child_task_id="child", wall_start=0,
+    )
+    run.emit_complete({"messages": []}, {"summary": "done", "status": "completed", "api_calls": 1}, 1.0)
+    assert events[-1][0] == "subagent.complete"
+    assert events[-1][1]["files_written"] == [str(own)]

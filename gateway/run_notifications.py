@@ -1092,7 +1092,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 )
         if verdict != "deliver":
             return verdict, "", ""
-        if (entry is not None and parent is not None and not parent.get("ended_at")
+        if (entry is not None and parent is not None and not parent.ended_at
                 and target_session_id != entry.session_id):
             # A live pin elsewhere has no authority to perform a route switch. Keep
             # preflight consistent with the in-turn resolver before acknowledging a claim.

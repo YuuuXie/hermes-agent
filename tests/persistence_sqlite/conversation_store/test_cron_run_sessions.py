@@ -15,7 +15,7 @@ from persistence.core.errors import AuthorityRefusal
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.conversation._store import portability
 from persistence.sqlite.conversation._store.portability import cron_run_identity, list_cron_job_runs
-from persistence.sqlite.conversation._store.sessions import create_session
+from persistence.sqlite.conversation._store.sessions import create_session, end_session
 from tests.fakes.cron_owner import admit_fire, cron_owner
 from tests.gateway.fixtures.storage_handles import close_storage_handles
 from tests.fixtures.storage_holder import raw_holder
@@ -115,28 +115,28 @@ def test_legacy_runs_of_a_job_whose_id_extends_another_stay_with_their_own_job(t
     assert [(r['id'], r['cron_job_id']) for r in digest] == [('cron_daily_digest_20261011_130000', 'daily_digest')]
 
 def test_retired_reused_root_and_rotated_tip_remain_readable(tmp_path):
-    with SessionDB(tmp_path / 'state.db') as db:
-        db.create_session('cron_daily', source='cron')
-        db.end_session('cron_daily', 'compression')
-        db.create_session('continuation-daily', source='cron', parent_session_id='cron_daily')
-        db.create_session('cron_daily_20261011_120000', source='cron')
-        db.create_session('cron_daily_digest', source='cron')
+    with StoreHolder(tmp_path / 'state.db') as db:
+        create_session(db, 'cron_daily', source='cron')
+        end_session(db, 'cron_daily', 'compression')
+        create_session(db, 'continuation-daily', source='cron', parent_session_id='cron_daily')
+        create_session(db, 'cron_daily_20261011_120000', source='cron')
+        create_session(db, 'cron_daily_digest', source='cron')
 
-        rows = db.list_cron_job_runs('daily')
+        rows = list_cron_job_runs(db, 'daily')
         ids = [row['id'] for row in rows]
         assert 'continuation-daily' in ids
         assert 'cron_daily_digest' not in ids
         assert 'cron_daily_20261011_120000' in ids
         assert [row['cron_execution_id'] for row in rows if row['id'] == 'continuation-daily'] == [None]
-        assert db.list_cron_job_runs('daily', limit=1, offset=0)[0]['id'] == ids[0]
-        assert db.list_cron_job_runs('daily', limit=1, offset=1)[0]['id'] == ids[1]
+        assert list_cron_job_runs(db, 'daily', limit=1, offset=0)[0]['id'] == ids[0]
+        assert list_cron_job_runs(db, 'daily', limit=1, offset=1)[0]['id'] == ids[1]
 
 def test_unrotated_reused_root_is_listed_only_for_its_exact_job(tmp_path):
-    with SessionDB(tmp_path / 'state.db') as db:
-        db.create_session('cron_daily', source='cron')
-        db.create_session('cron_daily_digest', source='cron')
-        assert [row['id'] for row in db.list_cron_job_runs('daily')] == ['cron_daily']
-        assert [row['id'] for row in db.list_cron_job_runs('daily_digest')] == ['cron_daily_digest']
+    with StoreHolder(tmp_path / 'state.db') as db:
+        create_session(db, 'cron_daily', source='cron')
+        create_session(db, 'cron_daily_digest', source='cron')
+        assert [row['id'] for row in list_cron_job_runs(db, 'daily')] == ['cron_daily']
+        assert [row['id'] for row in list_cron_job_runs(db, 'daily_digest')] == ['cron_daily_digest']
 
 
 def test_run_lookup_is_index_served_on_new_and_upgraded_stores(tmp_path, monkeypatch):

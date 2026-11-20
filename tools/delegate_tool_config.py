@@ -194,6 +194,14 @@ def _get_child_timeout() -> Optional[float]:
         "delegation.child_timeout_seconds=%r is not a valid number; using default (no timeout)",
     )
 
+def _get_handoff_grace_seconds() -> Optional[float]:
+    """Seconds before the current inactivity deadline to request one durable workspace handoff; <= 0 disables."""
+    return _knob(
+        "handoff_grace_seconds", "DELEGATION_HANDOFF_GRACE_SECONDS",
+        lambda value: seconds if (seconds := float(value)) > 0 else None, 300.0,
+        "delegation.handoff_grace_seconds=%r is not a valid number; using default (300s)",
+    )
+
 def _get_max_spawn_depth() -> int:
     """delegation.max_spawn_depth floored at 1 (no ceiling). Depth 0 is the parent; agents at depths 0..N-1 may spawn,
     depth N is the leaf floor. Default 1 is flat. Each extra level multiplies API cost."""

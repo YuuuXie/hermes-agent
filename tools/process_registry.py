@@ -2450,19 +2450,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     and s.id not in self._completion_consumed and s.id not in self._poll_observed]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
-                           to_session_key: str, note: str = "") -> Optional[ProcessSession]:
-        """Move a RUNNING process from one owner to another under the registry lock. Ownership is the ``owner_task_id``
-        field: completion notices are stamped from it at exit time and teardown kills by it, so flipping it here is the
-        whole transfer. Returns the session, or None when it is unknown, already exited, or not owned by ``from_owner``
-        (the caller must not report a transfer that did not happen)."""
-        session = self.get(session_id)
+                           to_session_key: str, note: str = "", to_parent_session_id: str = "") -> Optional[ProcessSession]:
+        """Move a running process and optional completion pin under the registry lock.
+        Return None unless the session is running and owned by ``from_owner``."""
         with self._lock:
+            session = self._running.get(session_id)
             if session is None or session.exited or session.owner_task_id != from_owner:
                 return None
             session.owner_task_id = to_owner
             session.task_id = to_task_id
             session.session_key = to_session_key
             session.handoff_note = note
+            if to_parent_session_id:
+                session.parent_session_id = to_parent_session_id
             return session
 
     def has_active_for_session(self, session_key: str, max_active_age: Optional[float] = None) -> bool:

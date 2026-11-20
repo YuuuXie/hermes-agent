@@ -16,7 +16,9 @@ from agent.compression_marker import elide
 from agent.interrupt_compat import request_hard_interrupt
 from dataclasses import dataclass, field
 from tools import file_state
-from tools.delegate_tool_config import _get_child_timeout, _get_subagent_approval_callback, _get_worktree_isolation
+from tools.delegate_tool_config import (
+    _get_child_timeout, _get_handoff_grace_seconds, _get_subagent_approval_callback, _get_worktree_isolation,
+)
 from tools.delegate_tool_progress import _quiet, _resolve_workspace_hint, _safe_progress
 from tools.delegate_tool_registry import (
     _capture_gateway_steer_authority, _close_subagent_steering, _mark_subagent_resumable, _register_subagent,
@@ -305,6 +307,12 @@ _LIVENESS_POLL_SECONDS = 5.0
 # Fraction of the inactivity budget after which the child is warned once (via its steer channel) that the window is
 # closing, so a child that is merely slow can wrap up and return instead of losing its whole context (#116001).
 _BUDGET_WARNING_FRACTION = 0.8
+_HANDOFF_STEER_TEXT = (
+    "[delegation inactivity warning] Before the current inactivity window expires, write a handoff file "
+    "in your workspace with completed work and paths/commits, concrete remaining steps, and the exact "
+    "test commands/results (or state that none ran). Do not claim unverified completion or start new work. "
+    "You may continue after writing it. This request is sent once."
+)
 
 def _budget_warning_text(idle_seconds: float, child_timeout: float) -> str:
     return (
@@ -839,6 +847,7 @@ class _ChildRun:
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
     deferred_future: Any = None
+    pending_future: Any = None
     turn_exit_reason: Optional[str] = None  # the child turn's own exit reason (who stopped it)
     final_entry: Optional[dict[str, Any]] = None
 
@@ -865,6 +874,11 @@ class _ChildRun:
         if info is None:
             return redact_child_result(entry_dict, getattr(self.child, "_delegate_output_schema", None), force=False)
         from tools import subagent_worktree
+        if self.pending_future is not None and not self.pending_future.done():
+            entry_dict["worktree"] = subagent_worktree.unproven_worktree_payload(
+                info, "worker still running; worktree preserved without inspection or pruning"
+            )
+            return redact_child_result(entry_dict, getattr(self.child, "_delegate_output_schema", None), force=False)
         from tools.delegate_tool_resumable import keeps_worktree
         try:
             # A child that may be continued keeps its tree (pinned until its record expires; the sweep then archives).
@@ -969,6 +983,9 @@ class _ChildRun:
             return
         deadline = time.monotonic() + child_timeout
         warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
+        grace = _get_handoff_grace_seconds()
+        handoff_at = deadline - min(grace, child_timeout / 2.0) if grace is not None else None
+        handoff_sent = False
         warned = False
         fingerprint = _child_activity_fingerprint(self.child)
         while True:
@@ -979,6 +996,8 @@ class _ChildRun:
             wait = min(_LIVENESS_POLL_SECONDS, remaining)
             if not warned:
                 wait = min(wait, max(warn_at - now, 0.0))
+            if handoff_at is not None and not handoff_sent:
+                wait = min(wait, max(handoff_at - now, 0.0))
             settled.wait(timeout=wait)
             if settled.is_set():
                 return  # the worker finished, or the heartbeat declared the child stale
@@ -987,10 +1006,24 @@ class _ChildRun:
                 fingerprint = current
                 deadline = time.monotonic() + child_timeout
                 warn_at = deadline - child_timeout * (1.0 - _BUDGET_WARNING_FRACTION)
+                handoff_at = deadline - min(grace, child_timeout / 2.0) if grace is not None else None
                 warned = False  # a fresh window gets its own warning
-            elif not warned and time.monotonic() >= warn_at:
-                warned = True
-                _warn_child_budget(self.child, child_timeout - (deadline - time.monotonic()), child_timeout)
+            else:
+                now = time.monotonic()
+                if handoff_at is not None and not handoff_sent and now >= handoff_at:
+                    handoff_sent = True
+                    if self.subagent_id:
+                        from tools.delegate_tool_registry import steer_subagent
+                        try:
+                            queued = steer_subagent(self.subagent_id, _HANDOFF_STEER_TEXT)
+                        except Exception:
+                            logger.warning("Inactivity handoff request failed for child %s", self.subagent_id, exc_info=True)
+                        else:
+                            if not queued:
+                                logger.warning("Inactivity handoff request rejected for child %s", self.subagent_id)
+                if not warned and now >= warn_at:
+                    warned = True
+                    _warn_child_budget(self.child, child_timeout - (deadline - now), child_timeout)
 
     def await_child(self) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], bool]:
         """Run the child's conversation on a daemon worker: ``(result, None, False)`` or ``(None, error_entry,
@@ -1036,6 +1069,7 @@ class _ChildRun:
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        self.pending_future = future
         child._delegate_worker_future = future
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
@@ -1142,6 +1176,10 @@ class _ChildRun:
             "diagnostic_path": diagnostic_path,
         }
         if is_timeout:
+            still_running = not future.done()
+            _error_entry["worker_still_running"] = still_running
+            _error_entry["worker_state"] = "quarantined" if still_running else "exited"
+        if is_timeout:
             self.timeout_evidence(_error_entry)
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
@@ -1202,9 +1240,9 @@ class _ChildRun:
         _files_read: list = []
         with _quiet(None):
             _files_read = list(file_state.known_reads(self.child_task_id))[:40]
-        _files_written_map: dict = {}
+        _files_written: list[str] = []
         with _quiet(None):
-            _files_written_map = file_state.writes_since("", self.wall_start, [])  # all writes since wall_start
+            _files_written = file_state.writes_by(self.child_task_id, self.wall_start)[:40]
         complete_kwargs: dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": entry["status"],
@@ -1215,7 +1253,7 @@ class _ChildRun:
             "reasoning_tokens": _num(getattr(child, "session_reasoning_tokens", 0)),
             "api_calls": _num(entry["api_calls"]),
             "files_read": _files_read,
-            "files_written": sorted({p for tid, paths in _files_written_map.items() if tid == self.child_task_id for p in paths})[:40],
+            "files_written": _files_written,
             "output_tail": _extract_output_tail(result, max_entries=8, max_chars=600),
         }
         if entry.get("failure_reason"):

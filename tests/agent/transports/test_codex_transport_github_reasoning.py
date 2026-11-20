@@ -23,3 +23,14 @@ def test_github_responses_requests_reasoning_summary(transport):
         profile_reasoning={"effort": "medium"},
     )
     assert kw.get("reasoning") == {"effort": "medium", "summary": "auto"}
+
+
+def test_github_astra_max_survives_responses_request_assembly(transport):
+    kwargs = transport.build_kwargs(
+        model="gpt-6.2-astra", messages=[{"role": "user", "content": "Hi"}], tools=[],
+        provider="github-copilot", base_url="https://api.githubcopilot.com",
+        reasoning_config={"effort": "max", "enabled": True},
+        profile_reasoning={"effort": "max"},
+    )
+    assert kwargs["model"] == "gpt-6.2-astra"
+    assert kwargs["reasoning"] == {"effort": "max", "summary": "auto"}

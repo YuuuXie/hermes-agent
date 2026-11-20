@@ -92,6 +92,8 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     )
 
     assert result["status"] == "timeout"
+    assert result["worker_still_running"] is True
+    assert result["worker_state"] == "quarantined"
     assert child.unwinding.wait(timeout=10)
     try:
         assert not child.closed.is_set(), (
@@ -122,7 +124,7 @@ def test_live_worker_retains_ownership_until_future_settles(monkeypatch):
     pool = Pool()
     finalized = []
     monkeypatch.setattr(delegate_tool, "_lease_child_credential", lambda _child: (pool, "lease"))
-    monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
+    monkeypatch.setattr(child_run, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(child_run, "_create_isolated_worktree", lambda *_: {"path": "/tmp/preserved", "branch": "test"})
     monkeypatch.setattr(subagent_worktree, "build_worktree_context_note", lambda _: "")
     monkeypatch.setattr(subagent_worktree, "finalize_subagent_worktree", lambda info: finalized.append(info))
@@ -130,6 +132,7 @@ def test_live_worker_retains_ownership_until_future_settles(monkeypatch):
 
     result = delegate_tool._run_single_child(0, "held worker", child, parent)
     assert result["status"] == "timeout"
+    assert result["worker_still_running"] is True
     assert result["worktree"]["path"] == "/tmp/preserved"
     assert "still running" in result["worktree"]["reason"]
     assert child.unwinding.wait(timeout=10)
@@ -143,6 +146,34 @@ def test_live_worker_retains_ownership_until_future_settles(monkeypatch):
                       timeout=10)
 
     assert finalized == []
+
+
+def test_inactivity_handoff_is_queued_once_and_disable_is_respected(monkeypatch):
+    from tools import delegate_tool_config
+
+    for grace, expected in ((0, 0), (0.2, 1)):
+        child = _SlowUnwindingChild()
+        child._subagent_id = f"handoff-{grace}"
+        steers = []
+        child.steer = lambda text: steers.append(text) or True
+        parent = SimpleNamespace(session_id="parent", _current_task_id=None,
+                                 _active_children=[child], _active_children_lock=threading.Lock())
+        monkeypatch.setattr(child_run, "_get_child_timeout", lambda: 0.5)
+        monkeypatch.setattr(child_run, "_get_handoff_grace_seconds", lambda: grace or None)
+        monkeypatch.setattr(child_run, "_get_worktree_isolation", lambda: False)
+        try:
+            result = delegate_tool._run_single_child(0, "held worker", child, parent)
+            assert result["status"] == "timeout"
+            assert len([text for text in steers if "write a handoff file" in text]) == expected
+            assert result["worker_still_running"] is True
+        finally:
+            child.allow_finish.set()
+        assert child.closed.wait(timeout=10)
+
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {"handoff_grace_seconds": 0})
+    assert delegate_tool_config._get_handoff_grace_seconds() is None
+    monkeypatch.setattr(delegate_tool_config, "_load_config", lambda: {"handoff_grace_seconds": 45})
+    assert delegate_tool_config._get_handoff_grace_seconds() == 45.0
 
 
 def test_parent_close_preserves_live_delegated_worker():
