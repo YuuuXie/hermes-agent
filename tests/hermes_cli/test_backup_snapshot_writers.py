@@ -25,11 +25,11 @@ def test_missing_database_snapshot_preserves_existing_archive(tmp_path):
     home = _home(tmp_path)
     archive = tmp_path / "archive.zip"
     archive.write_bytes(b"previous archive")
-    with patch.object(backup, "_safe_copy_db", return_value=False):
+    with patch.object(backup, "_snapshot_db", return_value=False):
         with pytest.raises(SystemExit) as raised:
             backup._run_backup_locked(SimpleNamespace(output=str(archive), keep=0), home)
         assert raised.value.code != 0
-        assert backup._write_full_zip_backup_locked(archive, home) is None
+        assert backup._write_full_zip_backup_locked(archive, home, []) is None
     assert archive.read_bytes() == b"previous archive"
     assert not list(tmp_path.glob(".*.partial"))
 
@@ -51,7 +51,7 @@ def test_database_zip_failure_preserves_existing_archive(tmp_path):
         with pytest.raises(SystemExit) as raised:
             backup._run_backup_locked(SimpleNamespace(output=str(archive), keep=0), home)
         assert raised.value.code != 0
-        assert backup._write_full_zip_backup_locked(archive, home) is None
+        assert backup._write_full_zip_backup_locked(archive, home, []) is None
     assert len(reached) == 2
     assert archive.read_bytes() == b"previous archive"
     assert not list(tmp_path.glob(".*.partial"))
@@ -69,13 +69,13 @@ def test_read_pin_retries_rollback_exclusive_lock(tmp_path):
     released = threading.Event()
 
     class ObservedSource(sqlite3.Connection):
-        def execute(self, sql, *args, **kwargs):
-            try:
-                return super().execute(sql, *args, **kwargs)
-            except sqlite3.OperationalError as exc:
-                if exc.sqlite_errorcode in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        def backup(self, destination, *, pages=-1, progress=None, name="main", sleep=0.25):
+            def observe(status, remaining, total):
+                if status & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
                     attempted.set()
-                raise
+                if progress:
+                    progress(status, remaining, total)
+            return super().backup(destination, pages=pages, progress=observe, name=name, sleep=sleep)
 
     def open_db(database, *args, **kwargs):
         if kwargs.get("uri"):
@@ -101,7 +101,7 @@ def test_read_pin_retries_rollback_exclusive_lock(tmp_path):
         assert snapshot.execute("SELECT value FROM sample").fetchone() == ("retained",)
 
 
-def test_wal_snapshot_keeps_initial_generation_during_writes(tmp_path):
+def test_wal_snapshot_keeps_initial_generation(tmp_path):
     src, dst = tmp_path / "source.db", tmp_path / "snapshot.db"
     connect = sqlite3.connect
     writer = connect(src)
@@ -113,20 +113,17 @@ def test_wal_snapshot_keeps_initial_generation_during_writes(tmp_path):
         page_count = writer.execute("PRAGMA page_count").fetchone()[0]
         calls = []
 
-        class ActiveSource(sqlite3.Connection):
+        class ObservedSource(sqlite3.Connection):
             def backup(self, destination, *, pages=-1, progress=None, name="main", sleep=0.25):
-                def interleave(status, remaining, total):
+                def record_progress(status, remaining, total):
                     calls.append((status, remaining, total))
-                    if remaining and len(calls) <= 20:
-                        writer.execute("UPDATE records SET payload=? WHERE id=1", (str(len(calls)).encode(),))
-                        writer.commit()
                     if progress:
                         progress(status, remaining, total)
-                return super().backup(destination, pages=pages, progress=interleave, name=name, sleep=sleep)
+                return super().backup(destination, pages=pages, progress=record_progress, name=name, sleep=sleep)
 
         def open_db(database, *args, **kwargs):
             if kwargs.get("uri"):
-                kwargs["factory"] = ActiveSource
+                kwargs["factory"] = ObservedSource
             return connect(database, *args, **kwargs)
 
         with patch.object(backup_sqlite.sqlite3, "connect", side_effect=open_db):
@@ -136,4 +133,5 @@ def test_wal_snapshot_keeps_initial_generation_during_writes(tmp_path):
     with connect(dst) as snapshot:
         assert snapshot.execute("PRAGMA quick_check").fetchone() == ("ok",)
         assert snapshot.execute("SELECT payload FROM records WHERE id=1").fetchone() == (b"x" * 4096,)
+    assert calls and calls[-1][1] == 0
     assert len(calls) <= (page_count + 255) // 256

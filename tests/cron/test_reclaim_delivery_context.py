@@ -37,7 +37,7 @@ def relay_notice(monkeypatch):
     config.get_home_channel.return_value = None
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
     monkeypatch.setattr(scheduler, "load_config", lambda: {"cron": {"wrap_response": False}})
-    monkeypatch.setattr("tools.send_message_tool.resolve_send_target",
+    monkeypatch.setattr("gateway.outbound.send.resolve_send_target",
                         lambda platform, rest, **kw: (rest, None, None))
     monkeypatch.setattr("cron.scheduler_delivery._deliver_standalone",
                         lambda *_a, **_kw: pytest.fail("reclaim must not fall back to standalone"))
