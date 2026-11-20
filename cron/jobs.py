@@ -1734,6 +1734,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "wrap_response": normalize_wrap_response,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
+    "session_mode": lambda value: _clear_retired_session_mode(value),
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
     "enabled_toolsets": _normalize_enabled_toolsets,
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
