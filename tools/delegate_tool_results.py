@@ -7,6 +7,7 @@ import json
 import threading
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
+from agent.redact import REDACTION_UNAVAILABLE
 from tools import delegate_tool_config
 from tools.delegation_redaction import (
     parent_copy, redact_child_result, redact_child_text, redact_child_value, redact_summary,
