@@ -24,6 +24,8 @@ TOOL_CALL_JSON_RE = re.compile(
 
 TOOL_CALL_CONTRACT = (
     "Available tools (OpenAI function schema). "
+    "This list is authoritative for Hermes tool calls: use only the tools listed here. "
+    "Do not claim a listed tool is unavailable. "
     "When using a tool, emit ONLY <tool_call>{...}</tool_call> with one JSON object "
     "containing id/type/function{name,arguments}. arguments must be a JSON string."
 )

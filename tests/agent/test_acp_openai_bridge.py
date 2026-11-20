@@ -3,9 +3,7 @@
 ACP has no OpenAI ``tools``/``tool_calls`` channel, so ``memory``,
 ``skill_manage``, ``todo`` and friends only work if the schemas travel into the
 prompt as text and the calls are parsed back out of the response text. These
-tests pin both halves plus the streaming shape, and check that the in-tree
-consumer (``agent/copilot_acp_client.py``) still produces the same prompt it did
-when it owned a private copy of this code.
+tests pin both halves plus the streaming shape and check the native ACP prompt.
 """
 
 from __future__ import annotations
@@ -14,6 +12,8 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+
+import pytest
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
@@ -189,15 +189,27 @@ def test_a_text_only_completion_streams_without_tool_call_deltas():
 # ── the in-tree consumer still speaks the same wire ──────────────────────────
 
 
-def test_copilot_prompt_still_carries_the_contract_and_the_tools():
-    """copilot-acp lost its private copy of the bridge; its prompt must not
-    change shape."""
+@pytest.mark.parametrize("tools", [_TOOLS, []], ids=["forwarded-tools", "no-tools"])
+def test_native_acp_prompt_defines_the_authoritative_hermes_tool_list(
+    tools: list[dict],
+) -> None:
     from agent.acp_client import _format_messages_as_prompt
 
     prompt = _format_messages_as_prompt(
-        [{"role": "user", "content": "hi"}], model="gpt-5", tools=_TOOLS,
+        [{"role": "user", "content": "hi"}], model="gpt-5", tools=tools,
     )
-    assert "<tool_call>{...}</tool_call>" in prompt
-    assert '"name": "memory"' in prompt
-    assert '"name": "read_file"' in prompt  # copilot forwards everything
     assert "hi" in prompt
+    assert "gpt-5" not in prompt
+    tool_section = next(
+        (section for section in prompt.split("\n\n") if section.startswith("Available tools ")),
+        "",
+    )
+    if not tools:
+        assert not tool_section
+        assert "authoritative" not in prompt
+        return
+    instructions, schemas = tool_section.split("\n", 1)
+    assert "authoritative for Hermes tool calls" in instructions
+    assert "Do not claim a listed tool is unavailable" in instructions
+    assert "<tool_call>{...}</tool_call>" in instructions
+    assert [schema["name"] for schema in json.loads(schemas)] == ["memory", "read_file"]

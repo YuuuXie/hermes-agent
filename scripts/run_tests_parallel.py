@@ -38,6 +38,8 @@ Environment:
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
                          ';' also works and drive letters are handled;
                          default: 'tests')
+    TMPDIR              Explicit POSIX parent for per-user runner scratch
+                        (default: /var/tmp where available)
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -89,7 +91,7 @@ def _rmtree_force(path: str) -> None:
     shutil.rmtree(path, onerror=_chmod_retry)
 
 def _runner_scratch_root() -> str:
-    """Per-run temp roots live on DISK, never the system temp dir: a full-suite run writes
+    """Without a caller override, keep per-run temp roots on disk: a full-suite run writes
     gigabytes of tmp_path fixtures and /tmp is RAM-backed tmpfs on many Linux hosts. /var/tmp is
     the FHS disk-backed temp root and is used because the alternatives fail tests that assume
     the root's shape: under the Hermes home conftest relocates the basetemp; under a dot-dir
@@ -102,7 +104,10 @@ def _runner_scratch_root() -> str:
     back that does not need root. Keying by uid means no run is blocked by another's leftovers.
     """
     name = "hermes-pytest" + (f"-{os.getuid()}" if hasattr(os, "getuid") else "")
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+    selected = os.environ.get("TMPDIR")
+    if os.name == "posix" and selected and selected != os.environ.get("HERMES_SCRATCH_DIR"):
+        root = os.path.join(os.path.abspath(selected), name)
+    elif os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), name)
     else:
         root = f"/var/tmp/{name}"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
@@ -652,14 +657,15 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
+    scratch_root = _runner_scratch_root()
+    temproot = tempfile.mkdtemp(prefix="r-", dir=scratch_root)
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the
     # parent's cleanup of ``temproot`` removes them too instead of leaving them in /tmp.
     env["TMPDIR"] = temproot
 
     subproc_start = time.monotonic()
-    proc, pgid = start_pytest(file, pytest_args, repo_root, env, _runner_scratch_root())
+    proc, pgid = start_pytest(file, pytest_args, repo_root, env, scratch_root)
 
     try:
         output, _ = proc.communicate(timeout=file_timeout)
