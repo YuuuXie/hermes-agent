@@ -24,7 +24,8 @@ def _record(row):
     """A session row as the storage interface's record: the fields the resolver reads, as attributes."""
     if row is None:
         return None
-    return SimpleNamespace(**{"ended_at": None, "end_reason": None, "source": None, "model_config": {}, **row})
+    return SimpleNamespace(**{"ended_at": None, "end_reason": None, "source": None,
+                              "created_source": None, "model_config": {}, **row})
 
 
 @pytest.fixture(autouse=True)
@@ -550,17 +551,16 @@ async def test_internal_completion_cannot_claim_human_route(tmp_path, pin_kind, 
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="owner-chat", chat_type="dm")
         current = store.get_or_create_session(source)
         human, key = current.session_id, current.session_key
-        db = store._db
+        db = store.persistence
         if pin_kind == "foreign_live":
-            db.create_session("foreign", source="telegram")
+            seed_session(db, "foreign", "telegram")
         else:
-            db.create_session("foreign", source="subagent", parent_session_id=human,
-                              model_config={"_delegate_from": human} if pin_kind == "relabeled_worker" else {})
-            db.record_gateway_session_peer("foreign", source="telegram", session_key=key,
-                                           chat_id=source.chat_id, chat_type="dm")
-        before = db.get_session(human)
+            seed_session(db, "foreign", "subagent", parent_session_id=human,
+                         model_config={"_delegate_from": human} if pin_kind == "relabeled_worker" else {})
+            store._record_gateway_session_peer("foreign", key, source)
+        before = session_row(db, human)
         if pin_kind == "relabeled_markerless":
-            worker = db.get_session("foreign")
+            worker = session_row(db, "foreign")
             assert worker["created_source"] == "subagent"
             assert (await runner._lookup_completion_owner("foreign"))[0] == "terminal"
         expected = "deliver" if pin_kind == "relabeled_worker" else "terminal"
@@ -568,5 +568,5 @@ async def test_internal_completion_cannot_claim_human_route(tmp_path, pin_kind, 
         resolved = await runner._resolve_async_delegation_session(current, "foreign")
         assert (resolved.session_id if resolved else None) == (human if pin_kind == "relabeled_worker" else None)
         assert store.peek_session_id(key) == human
-        assert db.get_session(human)["ended_at"] == before["ended_at"]
-        assert db.get_session(human)["end_reason"] == before["end_reason"]
+        assert session_row(db, human)["ended_at"] == before["ended_at"]
+        assert session_row(db, human)["end_reason"] == before["end_reason"]
