@@ -626,6 +626,9 @@ class GatewayStartupMixin:
         if candidates is None:
             return 0
         scheduled = 0
+        claims = getattr(self, "_resume_interruption_claims", None)
+        if claims is None:
+            claims = self._resume_interruption_claims = {}
         for entry in candidates:
             # Canonical admissions own restart decisions, including unknown pauses.
             # Legacy synthetic resume must not race their restored FIFO.
@@ -635,6 +638,9 @@ class GatewayStartupMixin:
             # Epoch math: the marker was stamped naive-local by the previous process, possibly
             # on the other side of a DST change; wall-clock subtraction is off by the shift.
             marker = entry.last_resume_marked_at or entry.updated_at
+            token = (entry.session_id, marker)
+            if claims.get(entry.session_key) == token:
+                continue
             if not _is_fresh_gateway_interruption(marker, window_secs=window):
                 continue
             # Already being resumed (e.g. scheduled at startup, still in-flight) — no second turn.
@@ -653,12 +659,14 @@ class GatewayStartupMixin:
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
             _resume_state = self._session_state(entry.session_key)
+            claims[entry.session_key] = token
             _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
             _resume_state.turn.started_ts = time.time()
             note_running_chat_owner(self, entry.session_key, source)  # this loop runs in the launch scope
             self._persist_active_agents()
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True,
+                                 metadata={"resume_interruption": token})
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )

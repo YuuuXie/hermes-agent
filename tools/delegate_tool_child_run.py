@@ -1036,6 +1036,7 @@ class _ChildRun:
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        child._delegate_worker_future = future
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway
@@ -1140,6 +1141,8 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        if is_timeout:
+            self.timeout_evidence(_error_entry)
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
         if close_deferred:
@@ -1229,8 +1232,20 @@ class _ChildRun:
         release credential lease → restore the parent's process-global tool names → detach from the parent's
         interrupt list → close the child (unless a timed-out worker still owns it) → pop the child's Relay scope if
         no turn is active."""
-        child = self.child
         heartbeat.stop()
+        pending = self.pending_future
+        if pending is not None and not pending.done():
+            # Stop only released the parent's wait. The worker still owns its lease, kernel,
+            # worktree and interrupt handle until the Future actually settles.
+            context = contextvars.copy_context()
+            pending.add_done_callback(lambda _f: context.run(
+                self._finish_cleanup, child_pool, leased_cred_id, True
+            ))
+            return
+        self._finish_cleanup(child_pool, leased_cred_id, close_deferred)
+
+    def _finish_cleanup(self, child_pool: Any, leased_cred_id: Any, close_deferred: bool) -> None:
+        child = self.child
 
         # Safe even if the child was never registered (ID missing on test doubles).
         retained = _unregister_subagent(self.subagent_id, agent=child, stopping=True) if self.subagent_id else None

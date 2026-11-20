@@ -357,6 +357,22 @@ def _process_accounting_lines(r: dict) -> list:
                      f"{u.get('exit_code')}) but the child never read its result; output tail:\n{u.get('output_tail', '')}")
     return lines
 
+def _timeout_evidence_lines(result: dict) -> list[str]:
+    if result.get("status") != "timeout":
+        return []
+    lines = []
+    for row in result.get("partial_output_tail") or []:
+        if isinstance(row, dict) and row.get("preview"):
+            lines.append(f"Completed {row.get('tool', 'tool')} output: {row['preview']}")
+    if result.get("child_session_id"):
+        lines.append(f"Child session: {result['child_session_id']}")
+    if result.get("files_written"):
+        lines.append("Files written: " + ", ".join(result["files_written"]))
+    worktree = result.get("worktree")
+    if isinstance(worktree, dict) and worktree.get("path"):
+        lines.append(f"Worktree: {worktree['path']}" + (f" (branch: {worktree['branch']})" if worktree.get("branch") else ""))
+    return lines
+
 
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
@@ -395,6 +411,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines += _recovery_lines(evt)
         if summary:
             lines += ["Partial output:", summary]
+    lines += _timeout_evidence_lines(evt)
     return "\n".join(lines)
 
 

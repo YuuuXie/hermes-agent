@@ -318,6 +318,28 @@ def _run_heartbeat(job_name: str):
             thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
 
 
+def _manual_delivery_context():
+    """Use the gateway loop and the owning profile's live adapters when available."""
+    # Manual runs and reclaims may be invoked outside the ticker. Live clients (Matrix/aiohttp)
+    # belong to the gateway loop; the launch profile's adapters must not leak to a satellite.
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    runner = runner_ref() if callable(runner_ref) else None
+    adapters = getattr(runner, "adapters", None) if runner is not None else None
+    if runner is not None and hasattr(runner, "_adapters_for_profile"):
+        from hermes_constants import get_hermes_home, profile_name_for_home
+
+        profile = profile_name_for_home(get_hermes_home())
+        adapters = runner._adapters_for_profile(profile)
+        # A shared-bot satellite borrows only exact routes owned by this profile.
+        if getattr(runner, "_is_shared_bot_satellite", lambda _p: False)(profile):
+            from cron.scheduler_preflight import (
+                SharedRouteAdapters, _primary_profile_routes_for_current_home)
+
+            adapters = SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+    gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
+    return adapters, gateway_loop
+
+
 def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) -> dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body (split from
     ``_execute_job_now`` so the background path can claim synchronously and hand the run
@@ -476,8 +498,10 @@ def _reap_stale_executions(job_name: str) -> None:
         # the exiting process before writing a terminal status (issue #86721). Safe and cheap: provably-dead
         # owners (PID gone, or PID reused by a different process per its start time) are reaped, as is a
         # live owner whose claim is older than the derived stale bound (the process itself is not killed).
-        from cron.executions import recover_interrupted_executions
-        _reclaimed = recover_interrupted_executions()
+        from cron.scheduler import _recover_interrupted_executions_with_alerts
+        adapters, gateway_loop = _manual_delivery_context()
+        _reclaimed = _recover_interrupted_executions_with_alerts(
+            adapters=adapters, loop=gateway_loop)
         if _reclaimed:
             logger.warning(
                 "Reclaimed %d stale cron execution(s) from dead owner(s) before dispatching job '%s'",

@@ -253,6 +253,11 @@ class GatewayNotificationOwnershipMixin:
         if target_session_id == session_entry.session_id:
             return session_entry
         prior_session_id = session_entry.session_id
+        if not follows_compression:
+            # A completion is not /resume: a live foreign pin cannot replace the human route.
+            logger.warning("Internal completion for %s does not own route %s (current=%s)",
+                           target_session_id, session_entry.session_key, prior_session_id)
+            return None
         if not self._is_session_run_current(session_entry.session_key, run_generation):
             logger.warning(
                 "Async-delegation completion for routing key %s was invalidated while resolving pinned "
@@ -260,16 +265,9 @@ class GatewayNotificationOwnershipMixin:
                 session_entry.session_key, pinned_session_id, prior_session_id,
             )
             return None
-        if follows_compression:
-            switched = await self.async_session_store.advance_compression_session(
-                session_entry.session_key, prior_session_id, target_session_id,
-            )
-        else:
-            # CAS on the session this completion resolved against: a route replaced meanwhile
-            # (/new, /resume) wins over the stale completion.
-            switched = await self.async_session_store.switch_session(
-                session_entry.session_key, target_session_id, expected_session_id=prior_session_id,
-            )
+        switched = await self.async_session_store.advance_compression_session(
+            session_entry.session_key, prior_session_id, target_session_id,
+        )
         if switched is None:
             logger.warning(
                 "Async-delegation completion could not bind routing key %s to "
